@@ -80,7 +80,6 @@ export function ensureGroupAutoConfig(dbMemory, jid) {
       blacklist: [],
     };
   }
-  // Mode interaksi diskusi: 'bebas' (nimbrung sesuai tema + reply), 'reply' (khusus reply/mention), 'off'
   if (!cfg.interactiveMode) cfg.interactiveMode = 'bebas';
   if (!cfg.interactiveSession) {
     cfg.interactiveSession = {
@@ -99,7 +98,7 @@ function getWibTimeAndDate() {
     timeZone: 'Asia/Jakarta',
     hour: '2-digit',
     minute: '2-digit',
-    hour12: false,
+    hourCycle: 'h23',
   }).format(now);
   const date = new Intl.DateTimeFormat('en-CA', {
     timeZone: 'Asia/Jakarta',
@@ -207,12 +206,81 @@ async function generateStudyMaterialAI(topic) {
 }
 
 // ============================================================
-// 1. WELCOME MASUK & KELUAR OTOMATIS
+// PENYARINGAN & PERSETUJUAN MEMBER MASUK OTOMATIS
+// ============================================================
+const processedJoinLock = new Set();
+
+export async function evaluateAndProcessJoinRequest(sock, dbMemory, jid, participant) {
+  const cfg = ensureGroupAutoConfig(dbMemory, jid);
+  const filter = cfg.memberFilter;
+  if (!filter?.enabled) return { handled: false };
+
+  const cleanNum = participant.split('@')[0].split(':')[0].replace(/\D/g, '');
+  const lockKey = `${jid}:${cleanNum}`;
+  if (processedJoinLock.has(lockKey)) return { handled: false };
+  processedJoinLock.add(lockKey);
+  setTimeout(() => processedJoinLock.delete(lockKey), 15000);
+
+  let rejectReason = '';
+
+  if (filter.blacklist.includes(cleanNum)) {
+    rejectReason = 'Nomor terdaftar di blacklist grup';
+  }
+
+  if (!rejectReason && Array.isArray(filter.allowedPrefixes) && filter.allowedPrefixes.length > 0) {
+    const allowed = filter.allowedPrefixes.some((pref) => cleanNum.startsWith(pref));
+    if (!allowed) {
+      rejectReason = `Hanya nomor berawalan ${filter.allowedPrefixes.join('/')} yang diizinkan`;
+    }
+  }
+
+  if (!rejectReason && filter.requirePhoto) {
+    const pp = await sock.profilePictureUrl(participant, 'image').catch(() => null);
+    if (!pp) {
+      rejectReason = 'Wajib memasang foto profil publik sebelum bergabung';
+    }
+  }
+
+  if (rejectReason) {
+    await sock.groupRequestParticipantsUpdate(jid, [participant], 'reject').catch(() => {});
+    await sock.sendMessage(jid, {
+      text: `🛡️ *FILTER MEMBER OTOMATIS*\n• Nomor: +${cleanNum}\n• Keputusan: ❌ *DITOLAK*\n• Alasan: ${rejectReason}`,
+    }).catch(() => {});
+    return { handled: true, approved: false, reason: rejectReason };
+  }
+
+  await sock.groupRequestParticipantsUpdate(jid, [participant], 'approve').catch(() => {});
+  await sock.sendMessage(jid, {
+    text: `🛡️ *FILTER MEMBER OTOMATIS*\n• Nomor: +${cleanNum}\n• Keputusan: ✅ *DISETUJUI OTOMATIS*`,
+  }).catch(() => {});
+  return { handled: true, approved: true };
+}
+
+export async function handleGroupJoinRequestEvent(sock, dbMemory, event) {
+  try {
+    const { id: jid, participant, action } = event || {};
+    if (!jid || !participant) return;
+    if (action && action !== 'request') return;
+    await evaluateAndProcessJoinRequest(sock, dbMemory, jid, participant);
+  } catch {}
+}
+
+// ============================================================
+// 1. WELCOME MASUK, KELUAR & REQUEST JOIN VIA PARTICIPANTS UPDATE
 // ============================================================
 export async function handleGroupParticipantsUpdate(sock, dbMemory, update) {
   try {
     const { id: jid, participants, action } = update;
     if (!jid || !jid.endsWith('@g.us') || !Array.isArray(participants)) return;
+
+    // Tangkap permintaan bergabung jika Baileys mengirimkannya lewat event ini
+    if (action === 'request') {
+      for (const participant of participants) {
+        await evaluateAndProcessJoinRequest(sock, dbMemory, jid, participant);
+      }
+      return;
+    }
+
     if (action !== 'add' && action !== 'remove') return;
 
     const cfg = ensureGroupAutoConfig(dbMemory, jid);
@@ -258,58 +326,6 @@ export async function handleGroupParticipantsUpdate(sock, dbMemory, update) {
         trackBotMessage(sent);
       }
     }
-  } catch {}
-}
-
-// ============================================================
-// 2. PENYARINGAN & PERSETUJUAN MEMBER MASUK OTOMATIS
-// ============================================================
-async function evaluateAndProcessJoinRequest(sock, dbMemory, jid, participant) {
-  const cfg = ensureGroupAutoConfig(dbMemory, jid);
-  const filter = cfg.memberFilter;
-  if (!filter?.enabled) return { handled: false };
-
-  const cleanNum = participant.split('@')[0].split(':')[0].replace(/\D/g, '');
-  let rejectReason = '';
-
-  if (filter.blacklist.includes(cleanNum)) {
-    rejectReason = 'Nomor terdaftar di blacklist grup';
-  }
-
-  if (!rejectReason && Array.isArray(filter.allowedPrefixes) && filter.allowedPrefixes.length > 0) {
-    const allowed = filter.allowedPrefixes.some((pref) => cleanNum.startsWith(pref));
-    if (!allowed) {
-      rejectReason = `Hanya nomor berawalan ${filter.allowedPrefixes.join('/')} yang diizinkan`;
-    }
-  }
-
-  if (!rejectReason && filter.requirePhoto) {
-    const pp = await sock.profilePictureUrl(participant, 'image').catch(() => null);
-    if (!pp) {
-      rejectReason = 'Wajib memasang foto profil publik sebelum bergabung';
-    }
-  }
-
-  if (rejectReason) {
-    await sock.groupRequestParticipantsUpdate(jid, [participant], 'reject').catch(() => {});
-    await sock.sendMessage(jid, {
-      text: `🛡️ *FILTER MEMBER OTOMATIS*\n• Nomor: +${cleanNum}\n• Keputusan: ❌ *DITOLAK*\n• Alasan: ${rejectReason}`,
-    }).catch(() => {});
-    return { handled: true, approved: false, reason: rejectReason };
-  }
-
-  await sock.groupRequestParticipantsUpdate(jid, [participant], 'approve').catch(() => {});
-  await sock.sendMessage(jid, {
-    text: `🛡️ *FILTER MEMBER OTOMATIS*\n• Nomor: +${cleanNum}\n• Keputusan: ✅ *DISETUJUI OTOMATIS*`,
-  }).catch(() => {});
-  return { handled: true, approved: true };
-}
-
-export async function handleGroupJoinRequestEvent(sock, dbMemory, event) {
-  try {
-    const { id: jid, participant, action } = event || {};
-    if (!jid || !participant || action !== 'request') return;
-    await evaluateAndProcessJoinRequest(sock, dbMemory, jid, participant);
   } catch {}
 }
 
@@ -378,7 +394,6 @@ async function executeGroupActivity(sock, jid, activity, dbMemory = null, saveMe
   trackBotMessage(sentMain);
   pushGroupHistory(jid, 'BOT', promptSummary.slice(0, 300));
 
-  // Otomatis aktifkan sesi interaksi tematik selama 3 jam ke depan
   if (dbMemory) {
     const cfg = ensureGroupAutoConfig(dbMemory, jid);
     cfg.interactiveSession = {
@@ -432,17 +447,14 @@ export async function handleGroupThemeInteraction({
 
     const { theme, lastPrompt, isLiveSession } = resolveTodayTheme(cfg);
 
-    // Jika mode 'reply', hanya merespons kalau di-reply atau dipanggil
     if (cfg.interactiveMode === 'reply' && !isReplyToBot && !isMentioningBot) {
       return false;
     }
 
-    // Jika mode 'bebas', merespons jika di-reply/dipanggil ATAU saat sesi tema sedang aktif
     if (!isReplyToBot && !isMentioningBot && !isLiveSession) {
       return false;
     }
 
-    // Anti-spam cooldown 4 detik per grup
     const lastHit = groupInteractionCooldown.get(jid) || 0;
     if (Date.now() - lastHit < 4000) return false;
     groupInteractionCooldown.set(jid, Date.now());
@@ -456,11 +468,11 @@ export async function handleGroupThemeInteraction({
       `TEMA JADWAL SAAT INI: "${theme}"\n` +
       (lastPrompt ? `KONTEKS MATERI/PERTANYAAN TERAKHIR YANG KAMU KIRIM:\n"${lastPrompt.slice(0, 350)}"\n\n` : '') +
       `ATURAN INTERAKSI:\n` +
-      `1. Bersikaplah hangat, akrab, suportif, dan interaktif (bukan kaku seperti dosen/robot).\n` +
-      `2. Jika member menjawab soal/tantangan, apresiasi jawabannya, koreksi dengan ramah jika ada yang kurang tepat, lalu beri pertanyaan lanjutan atau ajak member lain ikut menanggapi.\n` +
-      `3. Sesuaikan gaya dengan tema hari itu (misal: jika tema Bahasa Jepang N5, selipkan kosakata Jepang + romaji + artinya; jika Bahasa Jerman A2, selipkan frasa Jerman + artinya; jika Matematika, bimbing langkah demi langkah; jika Free Time/Sharing, ngobrol santai & seru).\n` +
+      `1. Bersikaplah hangat, akrab, suportif, dan interaktif.\n` +
+      `2. Jika member menjawab soal/tantangan, apresiasi jawabannya, koreksi dengan ramah jika ada yang kurang tepat, lalu beri pertanyaan lanjutan.\n` +
+      `3. Sesuaikan gaya dengan tema hari itu.\n` +
       `4. Jika pesan member hanya obrolan singkat yang tidak nyambung dengan tema dan bukan ditujukan kepadamu, balas tepat dengan kata: SKIP\n` +
-      `5. Jaga jawaban tetap ringkas (maksimal 3-5 kalimat pendek) agar enak dibaca di grup chat.`;
+      `5. Jaga jawaban tetap ringkas (maksimal 3-5 kalimat pendek).`;
 
     const userPrompt =
       `Riwayat obrolan terakhir di grup:\n${recentChat}\n\n` +
@@ -489,16 +501,22 @@ export async function handleGroupThemeInteraction({
 }
 
 // ============================================================
-// 5. SCHEDULER OTOMATIS (BUKA/TUTUP GRUP + KEGIATAN PER HARI)
+// 5. SCHEDULER OTOMATIS (BUKA/TUTUP GRUP + KEGIATAN + SWEEPER ACC)
 // ============================================================
 let schedulerStarted = false;
+let activeGroupSock = null;
 const executedLog = new Set();
 
 export function startGroupAutomationScheduler(sock, dbMemory, saveMemory = null) {
+  // Selalu perbarui referensi socket terbaru saat reconnect
+  activeGroupSock = sock;
   if (schedulerStarted) return;
   schedulerStarted = true;
 
   setInterval(async () => {
+    const currentSock = activeGroupSock;
+    if (!currentSock) return;
+
     try {
       const { time: nowWib, date: todayWib, day: todayDay } = getWibTimeAndDate();
       const groupJids = Object.keys(dbMemory.groupSettings || {});
@@ -507,28 +525,56 @@ export function startGroupAutomationScheduler(sock, dbMemory, saveMemory = null)
         if (!jid.endsWith('@g.us')) continue;
         const cfg = ensureGroupAutoConfig(dbMemory, jid);
 
+        // 1. Auto Buka Grup
         if (cfg.autoOpenTime && cfg.autoOpenTime === nowWib) {
           const runKey = `open:${jid}:${todayWib}:${nowWib}`;
           if (!executedLog.has(runKey)) {
             executedLog.add(runKey);
-            await sock.groupSettingUpdate(jid, 'not_announcement').catch(() => {});
-            await sock.sendMessage(jid, {
-              text: `🔓 *GRUP DIBUKA OTOMATIS* (${nowWib} WIB)\nSemua anggota sekarang dapat mengirim pesan kembali.`,
-            }).catch(() => {});
+            try {
+              await currentSock.groupSettingUpdate(jid, 'not_announcement');
+              await currentSock.sendMessage(jid, {
+                text: `🔓 *GRUP DIBUKA OTOMATIS* (${nowWib} WIB)\nSemua anggota sekarang dapat mengirim pesan kembali.`,
+              });
+            } catch {
+              await currentSock.sendMessage(jid, {
+                text: `⚠️ Gagal membuka grup otomatis (${nowWib} WIB). Pastikan bot sudah dijadikan *Admin Grup*.`,
+              }).catch(() => {});
+            }
           }
         }
 
+        // 2. Auto Tutup Grup
         if (cfg.autoCloseTime && cfg.autoCloseTime === nowWib) {
           const runKey = `close:${jid}:${todayWib}:${nowWib}`;
           if (!executedLog.has(runKey)) {
             executedLog.add(runKey);
-            await sock.groupSettingUpdate(jid, 'announcement').catch(() => {});
-            await sock.sendMessage(jid, {
-              text: `🔒 *GRUP DITUTUP OTOMATIS* (${nowWib} WIB)\nSementara hanya admin yang dapat mengirim pesan hingga jadwal buka berikutnya.`,
-            }).catch(() => {});
+            try {
+              await currentSock.groupSettingUpdate(jid, 'announcement');
+              await currentSock.sendMessage(jid, {
+                text: `🔒 *GRUP DITUTUP OTOMATIS* (${nowWib} WIB)\nSementara hanya admin yang dapat mengirim pesan hingga jadwal buka berikutnya.`,
+              });
+            } catch {
+              await currentSock.sendMessage(jid, {
+                text: `⚠️ Gagal menutup grup otomatis (${nowWib} WIB). Pastikan bot sudah dijadikan *Admin Grup*.`,
+              }).catch(() => {});
+            }
           }
         }
 
+        // 3. Penyapu Otomatis Antrean Join Request (Setiap siklus 20 detik)
+        if (cfg.memberFilter?.enabled) {
+          const pendingList = await currentSock.groupRequestParticipantsList(jid).catch(() => []);
+          if (Array.isArray(pendingList) && pendingList.length > 0) {
+            for (const reqItem of pendingList) {
+              const targetJid = reqItem?.jid || reqItem;
+              if (typeof targetJid === 'string') {
+                await evaluateAndProcessJoinRequest(currentSock, dbMemory, jid, targetJid);
+              }
+            }
+          }
+        }
+
+        // 4. Eksekusi Kegiatan Terjadwal Per Hari
         for (let i = 0; i < cfg.activities.length; i++) {
           const act = cfg.activities[i];
           const actDay = (act.day || 'setiap_hari').toLowerCase();
@@ -538,7 +584,7 @@ export function startGroupAutomationScheduler(sock, dbMemory, saveMemory = null)
             const actKey = `act:${jid}:${i}:${todayWib}:${nowWib}`;
             if (!executedLog.has(actKey)) {
               executedLog.add(actKey);
-              await executeGroupActivity(sock, jid, act, dbMemory, saveMemory).catch(() => {});
+              await executeGroupActivity(currentSock, jid, act, dbMemory, saveMemory).catch(() => {});
             }
           }
         }
@@ -546,7 +592,7 @@ export function startGroupAutomationScheduler(sock, dbMemory, saveMemory = null)
 
       if (executedLog.size > 500) executedLog.clear();
     } catch {}
-  }, 25 * 1000);
+  }, 20 * 1000);
 }
 
 // ============================================================
@@ -589,7 +635,6 @@ export async function handleGroupAutomationCommand({
 
   const cfg = ensureGroupAutoConfig(dbMemory, jid);
 
-  // KONTROL MODE INTERAKSI TEMATIK
   if (cmd === 'interaksi') {
     const mode = param.toLowerCase();
     if (!['bebas', 'reply', 'off'].includes(mode)) {
@@ -601,11 +646,10 @@ export async function handleGroupAutomationCommand({
             `💬 *PENGATURAN INTERAKSI BOT DI GRUP*\n` +
             `• Mode Saat Ini: *${cfg.interactiveMode.toUpperCase()}*\n` +
             `• Tema Aktif: *${cur.theme}*\n\n` +
-            `*Pilihan Mode:*\n` +
-            `• \`interaksi bebas\` — Bot aktif nimbrung diskusi saat sesi tema berjalan + saat di-reply/dipanggil\n` +
-            `• \`interaksi reply\` — Bot hanya membalas jika pesan bot di-reply atau namanya disebut\n` +
+            `• \`interaksi bebas\` — Aktif nimbrung saat sesi tema berjalan + reply\n` +
+            `• \`interaksi reply\` — Hanya membalas jika di-reply/dipanggil\n` +
             `• \`interaksi off\` — Matikan obrolan AI di grup\n` +
-            `• \`settema <judul>\` — Mulai sesi diskusi tema sekarang secara manual`,
+            `• \`settema <judul>\` — Buka sesi diskusi tema sekarang`,
         },
         { quoted: msg }
       );
@@ -623,11 +667,7 @@ export async function handleGroupAutomationCommand({
 
   if (cmd === 'settema') {
     if (!param) {
-      await sock.sendMessage(
-        jid,
-        { text: '⚠️ Contoh: `settema Bahasa Jepang N5 - Percakapan Sehari-hari`' },
-        { quoted: msg }
-      );
+      await sock.sendMessage(jid, { text: '⚠️ Contoh: `settema Bahasa Jepang N5 - Percakapan`' }, { quoted: msg });
       return true;
     }
     cfg.interactiveMode = cfg.interactiveMode === 'off' ? 'bebas' : cfg.interactiveMode;
@@ -640,7 +680,7 @@ export async function handleGroupAutomationCommand({
     await saveMemory();
 
     const opener = await askAIWithFallback(
-      `Sapa para member grup WhatsApp dengan ramah dan buka sesi diskusi interaktif bertema "${param}". Ajukan 1 pertanyaan pembuka yang seru agar member langsung ikut nimbrung.`,
+      `Sapa para member grup WhatsApp dengan ramah dan buka sesi diskusi interaktif bertema "${param}". Ajukan 1 pertanyaan pembuka yang seru.`,
       'Kamu adalah moderator sekaligus teman belajar yang seru di grup WhatsApp.'
     );
 
@@ -680,10 +720,10 @@ export async function handleGroupAutomationCommand({
           `• *Auto Buka / Tutup:* ${cfg.autoOpenTime || '-'} / ${cfg.autoCloseTime || '-'}\n` +
           `• *Filter & ACC Member:* ${cfg.memberFilter.enabled ? 'ON ✅' : 'OFF ❌'}\n` +
           `• *Kegiatan Terjadwal:* ${cfg.activities.length} jadwal`,
-        footer: 'Gunakan settema <topik> atau teskegiatan semua',
+        footer: 'Gunakan autobuka 06:00 / autotutup 22:00 / autoapprove',
         buttons: [
           { text: '🚀 Tes Semua Kegiatan', id: 'tessemuakegiatan' },
-          { text: '📋 List Kegiatan', id: 'listkegiatan' },
+          { text: '🛡️ Toggle ACC Member', id: 'autoapprove' },
           { text: '👋 Toggle Welcome', id: 'welcome' },
         ],
       },
@@ -741,13 +781,14 @@ export async function handleGroupAutomationCommand({
       await sock.sendMessage(jid, { text: '✅ Jadwal buka grup otomatis dimatikan.' }, { quoted: msg });
       return true;
     }
-    if (!isValidTimeFormat(param)) {
+    const cleanTime = param.replace('.', ':');
+    if (!isValidTimeFormat(cleanTime)) {
       await sock.sendMessage(jid, { text: '❌ Format jam harus `HH:mm` (24 jam), contoh: `06:30`' }, { quoted: msg });
       return true;
     }
-    cfg.autoOpenTime = param;
+    cfg.autoOpenTime = cleanTime;
     await saveMemory();
-    await sock.sendMessage(jid, { text: `🔓 Grup diatur *BUKA OTOMATIS* setiap pukul *${param} WIB*.` }, { quoted: msg });
+    await sock.sendMessage(jid, { text: `🔓 Grup diatur *BUKA OTOMATIS* setiap pukul *${cleanTime} WIB*.\n_(Pastikan bot adalah Admin Grup)_` }, { quoted: msg });
     return true;
   }
 
@@ -762,18 +803,20 @@ export async function handleGroupAutomationCommand({
       await sock.sendMessage(jid, { text: '✅ Jadwal tutup grup otomatis dimatikan.' }, { quoted: msg });
       return true;
     }
-    if (!isValidTimeFormat(param)) {
+    const cleanTime = param.replace('.', ':');
+    if (!isValidTimeFormat(cleanTime)) {
       await sock.sendMessage(jid, { text: '❌ Format jam harus `HH:mm` (24 jam), contoh: `22:00`' }, { quoted: msg });
       return true;
     }
-    cfg.autoCloseTime = param;
+    cfg.autoCloseTime = cleanTime;
     await saveMemory();
-    await sock.sendMessage(jid, { text: `🔒 Grup diatur *TUTUP OTOMATIS* setiap pukul *${param} WIB*.` }, { quoted: msg });
+    await sock.sendMessage(jid, { text: `🔒 Grup diatur *TUTUP OTOMATIS* setiap pukul *${cleanTime} WIB*.\n_(Pastikan bot adalah Admin Grup)_` }, { quoted: msg });
     return true;
   }
 
   if (cmd === 'syncjadwal') {
-    const targetTime = isValidTimeFormat(param) ? param : '19:00';
+    const cleanParamTime = param.replace('.', ':');
+    const targetTime = isValidTimeFormat(cleanParamTime) ? cleanParamTime : '19:00';
     const desc = meta?.desc || '';
     const dayRegex = /(senin|selasa|rabu|kamis|jumat|sabtu|minggu)[^:\n]*:\s*([^\n]+)/gi;
     const found = [];
@@ -835,9 +878,9 @@ export async function handleGroupAutomationCommand({
 
     if (firstTokens.length === 2 && VALID_DAYS.includes(firstTokens[0])) {
       day = firstTokens[0];
-      time = firstTokens[1];
+      time = firstTokens[1].replace('.', ':');
     } else {
-      time = firstTokens[0];
+      time = firstTokens[0].replace('.', ':');
     }
 
     if (!isValidTimeFormat(time)) {
@@ -960,6 +1003,18 @@ export async function handleGroupAutomationCommand({
   if (cmd === 'autoapprove') {
     cfg.memberFilter.enabled = !cfg.memberFilter.enabled;
     await saveMemory();
+
+    // Langsung proses permintaan gabung yang sudah mengantre jika baru diaktifkan
+    if (cfg.memberFilter.enabled) {
+      const pending = await sock.groupRequestParticipantsList(jid).catch(() => []);
+      for (const p of pending) {
+        const targetJid = p?.jid || p;
+        if (typeof targetJid === 'string') {
+          await evaluateAndProcessJoinRequest(sock, dbMemory, jid, targetJid);
+        }
+      }
+    }
+
     await sock.sendMessage(
       jid,
       {
@@ -967,7 +1022,8 @@ export async function handleGroupAutomationCommand({
           `🛡️ *Filter & ACC Member Otomatis:* ${cfg.memberFilter.enabled ? 'AKTIF ✅' : 'NONAKTIF ❌'}\n` +
           `• Prefix Diizinkan: *${cfg.memberFilter.allowedPrefixes.join(', ') || 'Semua Negara'}*\n` +
           `• Wajib Foto Profil: *${cfg.memberFilter.requirePhoto ? 'Ya' : 'Tidak'}*\n` +
-          `• Total Blacklist: *${cfg.memberFilter.blacklist.length} nomor*`,
+          `• Total Blacklist: *${cfg.memberFilter.blacklist.length} nomor*\n\n` +
+          `_(Pastikan opsi *Setujui peserta baru* di Setelan Grup WhatsApp sudah ON dan bot adalah Admin)_`,
       },
       { quoted: msg }
     );
@@ -1047,7 +1103,7 @@ export async function handleGroupAutomationCommand({
       await sock.sendMessage(jid, { text: '📭 Tidak ada permintaan bergabung yang menunggu persetujuan.' }, { quoted: msg });
       return true;
     }
-    const daftar = pending.map((p, i) => `${i + 1}. +${p.jid.split('@')[0]}`).join('\n');
+    const daftar = pending.map((p, i) => `${i + 1}. +${(p.jid || p).split('@')[0]}`).join('\n');
     await sendNativeInteractiveButtons(
       sock,
       jid,
@@ -1071,7 +1127,7 @@ export async function handleGroupAutomationCommand({
       await sock.sendMessage(jid, { text: '📭 Antrean permintaan kosong.' }, { quoted: msg });
       return true;
     }
-    const targets = pending.map((p) => p.jid);
+    const targets = pending.map((p) => p.jid || p);
     const act = cmd === 'accsemua' ? 'approve' : 'reject';
     await sock.groupRequestParticipantsUpdate(jid, targets, act).catch(() => {});
     await sock.sendMessage(
