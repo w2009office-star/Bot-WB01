@@ -7,7 +7,7 @@ import { downloadContentFromMessage } from '@whiskeysockets/baileys';
 
 const execFileAsync = promisify(execFile);
 
-/* Opsional (env): YTDLP_BIN, YTDLP_COOKIES, COBALT_API, COBALT_KEY */
+/* Opsional (env): YTDLP_BIN, YTDLP_COOKIES, YTDLP_PROXY, COBALT_API, COBALT_KEY */
 const YTDLP = process.env.YTDLP_BIN || 'yt-dlp';
 const MB = 1024 * 1024;
 const MAX_BYTES = 1900 * MB;          // batas dokumen WhatsApp (±2GB)
@@ -26,22 +26,49 @@ export const DOWNLOAD_COMMANDS = [
   'downloadmenu', 'dlmenu',
 ];
 
-const sec = (title, rows) => `*${title}*\n${rows.map(([c, d]) => `• \`.${c}\`${d ? ` — ${d}` : ''}`).join('\n')}`;
+/* ───────────────────────── Menu (satu sumber kebenaran) ───────────────────────── */
+
+// Baris: [pemakaian, keterangan]. Kata pertama pemakaian HARUS ada di DOWNLOAD_COMMANDS.
+const MENU_SECTIONS = [
+  ['🎵 MUSIK & YOUTUBE', [
+    ['play <judul>', 'audio + kartu info (alias .song)'],
+    ['play2 <judul>', 'versi video'],
+    ['spotify <judul/link>', 'cari & kirim audio'],
+    ['ytmp3 <link/judul/angka>', 'audio MP3'],
+    ['ytmp4 <link/judul/angka> [360|480|720|1080]', 'video (alias .ytdl, .video)'],
+    ['yts <judul>', 'cari, lalu `.ytmp3 2` untuk hasil ke-2'],
+  ]],
+  ['📱 SOSIAL MEDIA', [
+    ['tiktok <link>', 'video & slide (alias .tt)'],
+    ['ttmp3 <link>', 'audio TikTok'],
+    ['ttslide <link>', 'foto slide TikTok'],
+    ['capcut <link>'],
+    ['igdl <link>', 'Instagram'],
+    ['fb <link>', 'Facebook'],
+    ['twitter <link>', 'Twitter / X'],
+  ]],
+  ['📁 FILE & SUARA', [
+    ['mediafire <link>'],
+    ['gdrive <link>'],
+    ['gitclone <link repo>', 'unduh repo GitHub (.zip)'],
+    ['tts [en|id|ja...] <teks>', 'teks jadi suara'],
+  ]],
+];
+
+// Validasi otomatis: setiap perintah di menu wajib terdaftar.
+{
+  const bad = MENU_SECTIONS.flatMap(([, rows]) => rows.map(([u]) => u.split(' ')[0])).filter((c) => !DOWNLOAD_COMMANDS.includes(c));
+  if (bad.length) console.warn('[download] Menu memuat perintah yang tidak terdaftar:', bad.join(', '));
+}
+
+const sec = (title, rows) => `*${title}*\n${rows.map(([u, d]) => `• \`.${u}\`${d ? ` — ${d}` : ''}`).join('\n')}`;
 export const DOWNLOAD_MENU = [
   '*╭┈───〔 📥 MENU DOWNLOAD 〕┈───⊷*\n' +
-  '*│* _Chat pribadi: tempel link langsung otomatis terunduh_\n' +
-  '*│* _Grup: link WAJIB diawali perintah (mis. `.tiktok <link>`), link polos dihapus_\n' +
-  '*│* _Reaksi ⏳ → ✅ menandakan proses selesai_\n' +
+  '*│* Chat pribadi: tempel link langsung otomatis terunduh\n' +
+  '*│* Grup: link WAJIB diawali perintah (mis. `.tiktok <link>`), link polos dihapus\n' +
+  '*│* Reaksi ⏳ → ✅ menandakan proses selesai\n' +
   '*╰───────────────────────⊷*',
-  sec('🎵 MUSIK & YOUTUBE', [
-    ['play <judul>', 'audio + kartu info'], ['play2 <judul>', 'versi video'], ['spotify <judul/link>'],
-    ['ytmp3 <link/judul/angka>'], ['ytmp4 <link/judul> [360|480|720|1080]'], ['yts <judul>', 'lalu `.ytmp3 2` untuk pilih hasil ke-2'],
-  ]),
-  sec('📱 SOSIAL MEDIA', [
-    ['tiktok <link>', 'video & slide'], ['ttmp3 <link>'], ['ttslide <link>'], ['capcut <link>'],
-    ['igdl <link>'], ['fb <link>'], ['twitter <link>'],
-  ]),
-  sec('📁 FILE & SUARA', [['mediafire <link>'], ['gdrive <link>'], ['gitclone <link repo>'], ['tts [en|id|ja...] <teks>']]),
+  ...MENU_SECTIONS.map(([title, rows]) => sec(title, rows)),
 ].join('\n\n');
 
 /* ───────────────────────── Helper jaringan ───────────────────────── */
@@ -141,49 +168,140 @@ function cacheSet(key, val) {
 /* ───────────────────────── Engine: yt-dlp ───────────────────────── */
 
 let ytdlpOk;
+let ytdlpCheckedAt = 0;
+let lastYtError = '';
+
 async function hasYtdlp() {
-  if (ytdlpOk === undefined) {
-    try { await execFileAsync(YTDLP, ['--version'], { timeout: 8000 }); ytdlpOk = true; } catch { ytdlpOk = false; }
+  if (ytdlpOk === true) return true;
+  if (ytdlpOk === false && Date.now() - ytdlpCheckedAt < 60000) return false; // cek ulang tiap 1 menit
+  try {
+    await execFileAsync(YTDLP, ['--version'], { timeout: 8000 });
+    ytdlpOk = true;
+  } catch {
+    ytdlpOk = false;
+    lastYtError = 'yt-dlp tidak terpasang / tidak ada di PATH';
+    console.error('[yt-dlp]', lastYtError);
   }
+  ytdlpCheckedAt = Date.now();
   return ytdlpOk;
 }
 
-async function ytdlp(url, { audio = false, height = 720, signal } = {}) {
-  if (!(await hasYtdlp())) return null;
+/** Ubah pesan error yt-dlp menjadi alasan singkat yang bisa dimengerti. */
+function ytErrorHint(raw = lastYtError) {
+  const e = String(raw || '');
+  if (!e) return '';
+  if (/tidak terpasang/i.test(e)) return 'yt-dlp belum terpasang di server.';
+  if (/sign in to confirm|not a bot|cookies|login required/i.test(e)) return 'YouTube meminta verifikasi login (bot check). Set `YTDLP_COOKIES` ke file cookies.txt atau pakai `YTDLP_PROXY`.';
+  if (/age|confirm your age|inappropriate/i.test(e)) return 'Video dibatasi usia (butuh cookies akun).';
+  if (/private|members-only|membership/i.test(e)) return 'Video privat / khusus member.';
+  if (/unavailable|removed|not available|blocked|copyright|country/i.test(e)) return 'Video tidak tersedia / diblokir di wilayah server.';
+  if (/ffmpeg|ffprobe/i.test(e)) return 'ffmpeg belum terpasang di server.';
+  if (/requested format|n challenge|js runtime|deno|signature/i.test(e)) return 'yt-dlp sudah usang atau butuh JS runtime. Jalankan `yt-dlp -U` dan pasang `deno`.';
+  if (/max-filesize|larger than/i.test(e)) return 'File melebihi batas ±1.9GB WhatsApp.';
+  if (/timed out|timeout|connection|network/i.test(e)) return 'Koneksi ke YouTube timeout.';
+  return '';
+}
+const ytFailText = (what = 'video YouTube') => {
+  const hint = ytErrorHint();
+  return `❌ Gagal mengunduh ${what}.${hint ? `\nℹ️ ${hint}` : '\nCoba lagi, atau pakai resolusi lebih rendah, mis. `.ytmp4 <link> 360`.'}`;
+};
+
+// Urutan klien YouTube yang dicoba (null = bawaan yt-dlp). Berhenti di yang pertama berhasil.
+const YT_CLIENTS = [null, 'tv,web_safari', 'android_vr', 'ios', 'mweb'];
+const isYouTubeUrl = (u = '') => /(^|\/\/|\.)(youtube\.com|youtu\.be)/i.test(u);
+
+async function ytdlpOnce(url, { audio, height, signal }, client) {
   const base = `ytdlp_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
   const tmp = (f = '') => path.join(os.tmpdir(), f);
   const mine = async () => (await fsPromises.readdir(os.tmpdir())).filter((f) => f.startsWith(`${base}.`));
   const h = `height<=${height}`;
   const args = [
-    '--no-playlist', '--no-warnings', '--no-simulate', '--no-part',
+    '--no-playlist', '--no-warnings', '--no-simulate', '--no-part', '--no-mtime',
     '--print', 'after_move:%(title)s',
     '--max-filesize', `${Math.floor(MAX_BYTES / MB)}M`,
-    '--socket-timeout', '15', '--retries', '2', '--concurrent-fragments', '4',
+    '--socket-timeout', '15', '--retries', '3', '--concurrent-fragments', '4',
     '-o', tmp(`${base}.%(ext)s`),
     ...(process.env.YTDLP_COOKIES ? ['--cookies', process.env.YTDLP_COOKIES] : []),
+    ...(process.env.YTDLP_PROXY ? ['--proxy', process.env.YTDLP_PROXY] : []),
+    ...(client ? ['--extractor-args', `youtube:player_client=${client}`] : []),
     ...(audio
       ? ['-f', 'bestaudio/best', '-x', '--audio-format', 'mp3', '--audio-quality', '128K']
-      : ['-f', `bv*[${h}][ext=mp4]+ba[ext=m4a]/b[${h}][ext=mp4]/bv*[${h}]+ba/b[${h}]/b`, '--merge-output-format', 'mp4']),
+      : ['-f', `bv*[${h}][ext=mp4]+ba[ext=m4a]/b[${h}][ext=mp4]/bv*[${h}]+ba/b[${h}]/bv*+ba/b`, '--merge-output-format', 'mp4']),
     url,
   ];
   try {
-    const { stdout } = await execFileAsync(YTDLP, args, { timeout: YT_TIMEOUT, maxBuffer: 10 * MB, signal });
+    const { stdout, stderr } = await execFileAsync(YTDLP, args, { timeout: YT_TIMEOUT, maxBuffer: 10 * MB, signal });
     let best = null;
     for (const f of await mine()) {
       const st = await fsPromises.stat(tmp(f)).catch(() => null);
       if (st && (!best || st.size > best.size)) best = { f, size: st.size };
     }
-    if (!best || best.size < 1024) return null;
+    if (!best || best.size < 1024) {
+      lastYtError = String(stderr || '').trim().split('\n').pop() || 'Tidak ada file yang dihasilkan';
+      return null;
+    }
     return {
       buffer: await fsPromises.readFile(tmp(best.f)),
       title: stdout.trim().split('\n').filter(Boolean)[0] || 'Media',
       ext: path.extname(best.f).slice(1),
     };
-  } catch {
+  } catch (e) {
+    const err = String(e?.stderr || e?.message || '').trim().split('\n').filter(Boolean).slice(-2).join(' | ');
+    lastYtError = err || 'yt-dlp gagal';
+    console.error(`[yt-dlp${client ? `:${client}` : ''}]`, lastYtError.slice(0, 300));
     return null;
   } finally {
     for (const f of await mine().catch(() => [])) await fsPromises.unlink(tmp(f)).catch(() => {});
   }
+}
+
+async function ytdlp(url, { audio = false, height = 720, signal } = {}) {
+  if (!(await hasYtdlp())) return null;
+  const clients = isYouTubeUrl(url) ? YT_CLIENTS : [null];
+  for (const client of clients) {
+    if (signal?.aborted) return null;
+    const r = await ytdlpOnce(url, { audio, height, signal }, client);
+    if (r) return r;
+    // Kesalahan permanen → tidak perlu coba klien lain
+    if (/private|unavailable|removed|max-filesize|larger than|ffmpeg|tidak terpasang/i.test(lastYtError)) break;
+  }
+  return null;
+}
+
+/** Pencarian cadangan lewat yt-dlp (kalau scraping HTML YouTube gagal / kena consent page). */
+async function searchViaYtdlp(query) {
+  if (!(await hasYtdlp())) return [];
+  try {
+    const { stdout } = await execFileAsync(YTDLP, [
+      '--no-warnings', '--flat-playlist', '-J',
+      ...(process.env.YTDLP_COOKIES ? ['--cookies', process.env.YTDLP_COOKIES] : []),
+      ...(process.env.YTDLP_PROXY ? ['--proxy', process.env.YTDLP_PROXY] : []),
+      `ytsearch6:${query}`,
+    ], { timeout: 30000, maxBuffer: 10 * MB });
+    return (JSON.parse(stdout)?.entries || [])
+      .filter((e) => e?.id)
+      .slice(0, 6)
+      .map((e) => ({
+        id: e.id,
+        title: e.title || 'YouTube Video',
+        duration: fmtDuration(e.duration),
+        channel: e.channel || e.uploader || '',
+        views: e.view_count ? `${Number(e.view_count).toLocaleString('id-ID')} x ditonton` : '',
+        thumb: `https://i.ytimg.com/vi/${e.id}/hqdefault.jpg`,
+        url: `https://youtu.be/${e.id}`,
+      }));
+  } catch {
+    return [];
+  }
+}
+
+function fmtDuration(sec) {
+  if (!sec && sec !== 0) return 'LIVE';
+  const s = Math.floor(sec);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const r = String(s % 60).padStart(2, '0');
+  return h ? `${h}:${String(m).padStart(2, '0')}:${r}` : `${m}:${r}`;
 }
 
 /* ───────────────────────── Engine: API cadangan ───────────────────────── */
@@ -250,10 +368,10 @@ export async function downloadCapCut(url) {
   return y?.buffer ? { buffer: y.buffer, title: y.title || 'CapCut Video' } : null;
 }
 
-export async function searchYouTube(query) {
+async function scrapeYouTube(query) {
   try {
     const res = await fetchWithTimeout(`https://www.youtube.com/results?search_query=${encodeURIComponent(query)}&hl=id`, {
-      headers: { 'User-Agent': UA, 'Accept-Language': 'id,en;q=0.8' },
+      headers: { 'User-Agent': UA, 'Accept-Language': 'id,en;q=0.8', Cookie: 'CONSENT=YES+1; SOCS=CAI' },
     });
     const match = (await res.text()).match(/var ytInitialData = (\{.*?\});<\/script>/s);
     if (!match) return [];
@@ -277,7 +395,12 @@ export async function searchYouTube(query) {
   }
 }
 
-const ytId = (u = '') => (u.match(/(?:youtu\.be\/|v=|shorts\/|embed\/)([\w-]{11})/) || [])[1] || u;
+export async function searchYouTube(query) {
+  const r = await scrapeYouTube(query);
+  return r.length ? r : searchViaYtdlp(query);
+}
+
+const ytId = (u = '') => (u.match(/(?:youtu\.be\/|v=|shorts\/|embed\/|live\/)([\w-]{11})/) || [])[1] || u;
 
 /** Tanpa batas durasi: video/audio berapa pun panjangnya, selama ≤ MAX_BYTES. */
 export async function downloadYouTube(url, audioOnly = false, { height = 720 } = {}) {
@@ -285,6 +408,7 @@ export async function downloadYouTube(url, audioOnly = false, { height = 720 } =
   const cached = cacheGet(key);
   if (cached) return cached;
 
+  lastYtError = '';
   const y = await ytdlp(url, { audio: audioOnly, height });
   let out = y?.buffer ? { buffer: y.buffer, title: y.title } : null;
 
@@ -424,7 +548,7 @@ async function sendItems(sock, jid, items, msg, caption = '') {
 const PLATFORMS = [
   ['tiktok', /(^|\/\/|\.)tiktok\.com/],
   ['capcut', /(^|\/\/|\.)capcut\.com/],
-  ['youtube', /(^|\/\/|\.)youtube\.com\/(watch|shorts|live)|(^|\/\/)youtu\.be\//],
+  ['youtube', /(^|\/\/|\.)youtube\.com\/(watch|shorts|live|embed)|(^|\/\/)youtu\.be\//],
   ['igdl', /(^|\/\/|\.)instagram\.com\/(p|reel|reels|tv|stories)\//],
   ['fb', /(^|\/\/|\.)facebook\.com|(^|\/\/)fb\.watch|(^|\/\/)fb\.com/],
   ['twitter', /(^|\/\/|\.)(twitter|x)\.com\/[^/]+\/status\//],
@@ -467,7 +591,7 @@ async function runGeneric(sock, jid, platform, url, msg, { height = 480 } = {}) 
 
   if (platform === 'youtube') {
     const yt = await downloadYouTube(url, false, { height });
-    if (!yt?.buffer) return fail(sock, jid, msg, '❌ Gagal mengunduh video YouTube (terlalu besar atau dibatasi).');
+    if (!yt?.buffer) return fail(sock, jid, msg, ytFailText('video YouTube'));
     return sendItems(sock, jid, [{ type: 'video', buffer: yt.buffer, title: yt.title }], msg, `🎬 *${yt.title || 'YouTube'}*`);
   }
 
@@ -550,11 +674,11 @@ async function dispatch({ sock, jid, cmd, param, msg, reply }) {
     if (!t?.url) return failMsg(HELP(cmd, 'https://youtu.be/... atau judul lagu'));
     const isAud = cmd === 'ytmp3';
     const yt = await downloadYouTube(t.url, isAud, { height });
-    if (!yt?.buffer) return failMsg('❌ Gagal mengunduh media YouTube (terlalu besar atau dibatasi). Coba resolusi lebih rendah, mis. `.ytmp4 <link> 360`.');
+    if (!yt?.buffer) return failMsg(ytFailText(isAud ? 'audio YouTube' : 'video YouTube'));
     lastPlaySession.set(jid, { url: t.url, title: yt.title });
     const name = safeName(yt.title || t.title || 'media');
     const item = isAud ? { type: 'audio', buffer: yt.buffer, fileName: `${name}.mp3` } : { type: 'video', buffer: yt.buffer, title: name };
-    return sendItems(sock, jid, [item], msg, `🎬 *${yt.title || t.title}*\n_${height}p_`);
+    return sendItems(sock, jid, [item], msg, isAud ? '' : `🎬 *${yt.title || t.title}*\n_${height}p_`);
   }
 
   if (['play', 'play2', 'song', 'spotify'].includes(cmd)) {
@@ -566,7 +690,7 @@ async function dispatch({ sock, jid, cmd, param, msg, reply }) {
     // Kartu info dikirim paralel dengan proses unduh agar terasa cepat
     const cardP = (t.thumb ? sock.sendMessage(jid, { image: { url: t.thumb }, caption: card }, { quoted: msg }).catch(() => reply(card)) : reply(card)).catch(() => {});
     const [, yt] = await Promise.all([cardP, downloadYouTube(t.url, !asVideo, { height: 480 })]);
-    if (!yt?.buffer) return failMsg(`❌ Gagal mengambil ${asVideo ? 'video' : 'audio'} untuk *${t.title || param}*.`);
+    if (!yt?.buffer) return failMsg(ytFailText(`${asVideo ? 'video' : 'audio'} *${t.title || param}*`));
     const name = safeName(yt.title || t.title || 'lagu');
     const item = asVideo ? { type: 'video', buffer: yt.buffer, title: name } : { type: 'audio', buffer: yt.buffer, fileName: `${name}.mp3` };
     return sendItems(sock, jid, [item], msg, asVideo ? `🎬 *${name}*` : '');
