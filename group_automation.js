@@ -22,7 +22,7 @@ export const GROUP_SECURITY_MENU =
   `*╭┈───〔 🛡️ MENU KEAMANAN GRUP 〕┈───⊷*\n` +
   `*│* _@nomor bisa tag atau ketik 628xxx_\n` +
   `*│* _👑 VVIP: admin grup kebal kick & demote_\n` +
-  `*│* _📥 Link downloader (TikTok, YT, IG, dll) tidak dihapus anti-link_\n` +
+  `*│* _📥 Link hanya boleh dengan perintah download (mis. tiktok <link>)_\n` +
   `*╰───────────────────────⊷*\n\n` +
   `*🔒 PROTEKSI CHAT*\n` +
   `• \`.antilink on/off\`\n` +
@@ -199,32 +199,21 @@ export function ensureGroupAutoConfig(dbMemory, jid) {
   return cfg;
 }
 
-export async function isSenderGroupAdmin(sock, jid, senderParticipant, senderNum, altNum = '', isOwner = false, prefetchedMeta = null) {
+export function isJidGroupAdmin(meta, ...ids) {
+  const want = new Set(ids.map(jidDigits).filter(Boolean));
+  const p = (meta?.participants || []).find((x) => [x.id, x.phoneNumber, x.lid, x.jid].some((v) => want.has(jidDigits(v))));
+  return ['admin', 'superadmin'].includes(p?.admin);
+}
+
+export async function isSenderGroupAdmin(sock, jid, senderParticipant, senderNum, altNum = '', isOwner = false, meta = null) {
   if (isOwner) return true;
   if (!jid?.endsWith('@g.us')) return false;
   try {
-    const meta = prefetchedMeta || (await sock.groupMetadata(jid));
-    const wanted = new Set([jidDigits(senderParticipant), digitsOnly(senderNum), digitsOnly(altNum)].filter(Boolean));
-    const info = (meta?.participants || []).find((p) => {
-      if (senderParticipant && p.id === senderParticipant) return true;
-      return [p.id, p.phoneNumber, p.lid, p.jid].some((x) => {
-        const d = jidDigits(x);
-        return d && wanted.has(d);
-      });
-    });
-    return info?.admin === 'admin' || info?.admin === 'superadmin';
+    return isJidGroupAdmin(meta || await sock.groupMetadata(jid), senderParticipant, senderNum, altNum);
   } catch (e) {
     logErr('isSenderGroupAdmin', e);
     return false;
   }
-}
-
-// 👑 VVIP: true jika JID (nomor / LID) adalah admin atau superadmin di metadata grup
-export function isJidGroupAdmin(meta, jid) {
-  const d = jidDigits(jid);
-  if (!d) return false;
-  const info = (meta?.participants || []).find((p) => p.id === jid || [p.id, p.phoneNumber, p.lid, p.jid].some((x) => jidDigits(x) === d));
-  return info?.admin === 'admin' || info?.admin === 'superadmin';
 }
 
 /* ───────────────────────── Penjaga pesan (anti-*) ───────────────────────── */
@@ -235,54 +224,33 @@ function pruneSpamTracker(now) {
   }
 }
 
-// 📥 Link dari platform ini dianggap permintaan download (perintah bot / auto-download), bukan spam link
-const DOWNLOAD_HOSTS = /^(?:[\w-]+\.)*(tiktok\.com|capcut\.com|youtube\.com|youtu\.be|instagram\.com|facebook\.com|fb\.watch|fb\.com|twitter\.com|x\.com|mediafire\.com|drive\.google\.com|github\.com|open\.spotify\.com)$/i;
+const DL_CMDS = new Set('tiktok tt ttmp3 yt youtube ytmp3 ytmp4 yta ytv play ig instagram igdl fb facebook fbdl twitter tw x capcut mediafire mf gdrive github spotify dl download'.split(' '));
+const DL_HOSTS = /^(?:[\w-]+\.)*(?:tiktok|capcut|youtube|instagram|facebook|fb|twitter|x|mediafire|github|spotify)\.com$|^(?:youtu\.be|fb\.watch|drive\.google\.com)$/i;
+const LINK_RE = /(https?:\/\/|www\.|chat\.whatsapp\.com|wa\.me\/)/i;
+const LINK_TOKEN = /(?:https?:\/\/|www\.)\S+|(?:chat\.whatsapp\.com|wa\.me)\/\S*/gi;
+const clean = (arr, min = 1) => arr.map((w) => String(w ?? '').toLowerCase().trim()).filter((w) => w.length >= min);
+const hostOf = (u) => { try { return new URL(/^https?:/i.test(u) ? u : `https://${u}`).hostname; } catch { return ''; } };
 
-// true = pesan berisi link, dan SEMUA link-nya berasal dari platform downloader
-function isDownloadLinkMessage(text) {
-  const urls = String(text).match(/(?:https?:\/\/|www\.)[^\s<>"]+/gi) || [];
-  if (!urls.length) return false;
-  return urls.every((u) => {
-    try {
-      return DOWNLOAD_HOSTS.test(new URL(/^https?:/i.test(u) ? u : `https://${u}`).hostname);
-    } catch {
-      return false;
-    }
-  });
-}
+// link lolos hanya jika diawali perintah download & semua link dari platform downloader
+const isDownloadRequest = (text, extra = []) => {
+  const links = text.match(LINK_TOKEN);
+  const cmd = text.trim().split(/\s+/)[0].replace(/^\W+/, '').toLowerCase();
+  return Boolean(links) && (DL_CMDS.has(cmd) || extra.includes(cmd)) && links.every((u) => DL_HOSTS.test(hostOf(u)));
+};
 
 function detectViolation({ text, lower, cfg, bot, dbMemory, jid, spamKey }) {
-  if (cfg.antivirtek || cfg.antibug) {
-    const combining = (text.match(/[\u0300-\u036f]/g) || []).length;
-    const invisible = (text.match(/[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g) || []).length;
-    if (text.length > 3500 || combining > 25 || invisible > 40) return 'virtek';
-  }
-
+  const count = (re) => (text.match(re) || []).length;
+  if ((cfg.antivirtek || cfg.antibug) && (text.length > 3500 || count(/[\u0300-\u036f]/g) > 25 || count(/[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g) > 40)) return 'virtek';
   if (cfg.antispam) {
-    const key = `${jid}:${spamKey}`;
     const now = Date.now();
-    const hist = (groupSpamTracker.get(key) || []).filter((t) => now - t < 5000);
-    hist.push(now);
+    const key = `${jid}:${spamKey}`;
+    const hist = (groupSpamTracker.get(key) || []).filter((t) => now - t < 5000).concat(now);
     groupSpamTracker.set(key, hist);
     if (groupSpamTracker.size > 3000) pruneSpamTracker(now);
     if (hist.length > 6) return 'spam';
   }
-
-  if (cfg.antitoxic) {
-    const badWords = [...(bot?.badWords || []), ...(dbMemory.learnedWords || [])]
-      .map((w) => String(w ?? '').toLowerCase().trim())
-      .filter((w) => w.length >= 2);
-    if (badWords.some((w) => lower.includes(w))) return 'toxic';
-  }
-
-  if (cfg.antilink) {
-    // Link downloader (mis. `.tiktok https://vt.tiktok.com/...` atau link yang ditempel langsung)
-    // dibiarkan agar bisa diproses bot. Link lain tetap dihapus.
-    if (!isDownloadLinkMessage(text)) {
-      const blocked = (bot?.blockedDomains || []).map((d) => String(d ?? '').toLowerCase().trim()).filter(Boolean);
-      if (/(https?:\/\/|www\.|chat\.whatsapp\.com|wa\.me\/)/i.test(text) || blocked.some((d) => lower.includes(d))) return 'link';
-    }
-  }
+  if (cfg.antitoxic && clean([...(bot?.badWords || []), ...(dbMemory.learnedWords || [])], 2).some((w) => lower.includes(w))) return 'toxic';
+  if (cfg.antilink && !isDownloadRequest(text, bot?.downloadCommands) && (LINK_RE.test(text) || clean(bot?.blockedDomains || []).some((d) => lower.includes(d)))) return 'link';
   return null;
 }
 
@@ -414,6 +382,13 @@ export async function evaluateAndProcessJoinRequest(sock, dbMemory, jid, partici
   return { handled: true, approved: !rejectReason };
 }
 
+const processPending = async (sock, dbMemory, jid) => {
+  for (const p of (await sock.groupRequestParticipantsList(jid).catch(() => [])) || []) {
+    const t = jidOf(p);
+    if (t) await evaluateAndProcessJoinRequest(sock, dbMemory, jid, t, phoneHintOf(p));
+  }
+};
+
 export async function handleGroupJoinRequestEvent(sock, dbMemory, event) {
   try {
     const act = String(event?.action || 'created').toLowerCase();
@@ -443,18 +418,10 @@ export async function handleGroupParticipantsUpdate(sock, dbMemory, update) {
     for (const p of participants) {
       const pJid = jidOf(p);
       if (!pJid || isBotJid(sock, pJid)) continue;
-      const userTag = `@${jidDigits(pJid)}`;
-      if (action === 'add') {
-        const text = formatWelcomeTemplate(cfg.welcomeText, { userTag, ...info });
-        const ppUrl = await sock.profilePictureUrl(pJid, 'image').catch(() => null);
-        const sent = await sock.sendMessage(jid, ppUrl ? { image: { url: ppUrl }, caption: text, mentions: [pJid] } : { text, mentions: [pJid] }).catch(async () => (
-          sock.sendMessage(jid, { text, mentions: [pJid] }).catch(() => null)
-        ));
-        trackBotMessage(sent);
-      } else {
-        const sent = await sock.sendMessage(jid, { text: formatWelcomeTemplate(cfg.goodbyeText, { userTag, ...info }), mentions: [pJid] }).catch(() => null);
-        trackBotMessage(sent);
-      }
+      const text = formatWelcomeTemplate(action === 'add' ? cfg.welcomeText : cfg.goodbyeText, { userTag: `@${jidDigits(pJid)}`, ...info });
+      const plain = { text, mentions: [pJid] };
+      const pp = action === 'add' ? await sock.profilePictureUrl(pJid, 'image').catch(() => null) : null;
+      trackBotMessage(await sock.sendMessage(jid, pp ? { image: { url: pp }, caption: text, mentions: [pJid] } : plain).catch(() => sock.sendMessage(jid, plain).catch(() => null)));
     }
   } catch (e) {
     logErr('handleGroupParticipantsUpdate', e);
@@ -613,11 +580,7 @@ async function schedulerTick() {
 
         if (cfg.memberFilter.enabled && Date.now() - (pendingPollAt.get(jid) || 0) >= 60000) {
           pendingPollAt.set(jid, Date.now());
-          const pending = await sock.groupRequestParticipantsList(jid).catch(() => []);
-          for (const item of pending || []) {
-            const target = jidOf(item);
-            if (target) await evaluateAndProcessJoinRequest(sock, dbMemory, jid, target, phoneHintOf(item));
-          }
+          await processPending(sock, dbMemory, jid);
         }
 
         const liveKeys = new Set(['open', 'close']);
@@ -1020,13 +983,7 @@ async function runGroupCommand({ sock, jid, isGroup, senderParticipant, senderNu
     cfg.memberFilter.enabled = explicit === null ? !cfg.memberFilter.enabled : explicit;
     await save();
     await reply(`🛡️ *Auto ACC Member:* ${cfg.memberFilter.enabled ? 'ON ✅' : 'OFF ❌'}\n• Kode: *${cfg.memberFilter.allowedPrefixes.join(', ') || 'Semua'}* | Wajib PP: *${cfg.memberFilter.requirePhoto ? 'ON' : 'OFF'}*`);
-    if (cfg.memberFilter.enabled) {
-      const pending = await sock.groupRequestParticipantsList(jid).catch(() => []);
-      for (const p of pending || []) {
-        const target = jidOf(p);
-        if (target) await evaluateAndProcessJoinRequest(sock, dbMemory, jid, target, phoneHintOf(p));
-      }
-    }
+    if (cfg.memberFilter.enabled) await processPending(sock, dbMemory, jid);
     return true;
   }
 
@@ -1050,41 +1007,26 @@ async function runGroupCommand({ sock, jid, isGroup, senderParticipant, senderNu
     return true;
   }
 
-  if (cmd === 'wajibpp') {
-    const explicit = onOff(param);
-    cfg.memberFilter.requirePhoto = explicit === null ? !cfg.memberFilter.requirePhoto : explicit;
-    if (cfg.memberFilter.requirePhoto) cfg.memberFilter.enabled = true;
+  const mf = cfg.memberFilter;
+  const setPrefix = async (v) => {
+    mf.allowedPrefixes = v.toLowerCase() === 'all' ? [] : v.split(/[,\s]+/).map(digitsOnly).filter(Boolean);
+    mf.enabled = true;
     await save();
-    await reply(`✅ Wajib foto profil: *${cfg.memberFilter.requirePhoto ? 'ON ✅' : 'OFF ❌'}*`);
-    return true;
-  }
-
-  if (cmd === 'kode') {
-    if (!param) { await reply('⚠️ Contoh: `.kode 62` (atau `.kode 62,60` / `.kode all`)'); return true; }
-    cfg.memberFilter.allowedPrefixes = param.toLowerCase() === 'all' ? [] : param.split(/[,\s]+/).map((p) => digitsOnly(p)).filter(Boolean);
-    cfg.memberFilter.enabled = true;
+    return reply(`✅ Filter awalan nomor: *${mf.allowedPrefixes.join(', ') || 'Semua Negara'}*`);
+  };
+  const setPhoto = async (v) => {
+    const on = onOff(v);
+    mf.requirePhoto = on === null ? !mf.requirePhoto : on;
+    if (mf.requirePhoto) mf.enabled = true;
     await save();
-    await reply(`✅ Filter awalan nomor: *${cfg.memberFilter.allowedPrefixes.join(', ') || 'Semua Negara'}*`);
-    return true;
-  }
-
+    return reply(`✅ Wajib foto profil: *${mf.requirePhoto ? 'ON ✅' : 'OFF ❌'}*`);
+  };
+  if (cmd === 'wajibpp') { await setPhoto(param); return true; }
+  if (cmd === 'kode') { await (param ? setPrefix(param) : reply('⚠️ Contoh: `.kode 62` (atau `.kode 62,60` / `.kode all`)')); return true; }
   if (cmd === 'setfilter') {
-    const [subRaw, ...rest] = param.split(/\s+/);
-    const sub = (subRaw || '').toLowerCase();
-    const val = rest.join(',').trim();
-    if (sub === 'prefix' && val) {
-      cfg.memberFilter.allowedPrefixes = val.toLowerCase() === 'all' ? [] : val.split(/[,\s]+/).map((p) => digitsOnly(p)).filter(Boolean);
-      cfg.memberFilter.enabled = true;
-      await save();
-      await reply(`✅ Filter prefix: *${cfg.memberFilter.allowedPrefixes.join(', ') || 'Semua Negara'}*`);
-    } else if (sub === 'pp' && val) {
-      cfg.memberFilter.requirePhoto = onOff(val) === true;
-      cfg.memberFilter.enabled = true;
-      await save();
-      await reply(`✅ Wajib foto profil: *${cfg.memberFilter.requirePhoto ? 'AKTIF' : 'NONAKTIF'}*`);
-    } else {
-      await reply('⚠️ Gunakan `.kode 62` atau `.wajibpp on/off`');
-    }
+    const [sub, ...rest] = param.toLowerCase().split(/\s+/);
+    const v = rest.join(',');
+    await (sub === 'prefix' && v ? setPrefix(v) : sub === 'pp' && v ? setPhoto(v) : reply('⚠️ Gunakan `.kode 62` atau `.wajibpp on/off`'));
     return true;
   }
 
