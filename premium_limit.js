@@ -1,5 +1,7 @@
 import http from 'http';
 import crypto from 'crypto';
+import fsPromises from 'fs/promises';
+import path from 'path';
 import { fetchWithTimeout } from './engines.js'; // sesuaikan: file yang meng-export fetchWithTimeout
 
 export const PREMIUM_COMMANDS = ['limit', 'ceklimit', 'premium', 'belipremium', 'qris', 'cekstatus', 'konfirmasi', 'accprem', 'addprem', 'delprem'];
@@ -7,21 +9,23 @@ export const PREMIUM_COMMANDS = ['limit', 'ceklimit', 'premium', 'belipremium', 
 const DAILY_FREE_LIMIT = 15;
 const DANA_NUMBER = process.env.DANA_NUMBER || '085811980122';
 const OWNER_NUMBER = (process.env.OWNER_NUMBER || '').replace(/\D/g, '');
-const STATIC_QRIS_URL = process.env.QRIS_IMAGE_URL || '';
-const STATIC_QRIS_PAYLOAD = process.env.QRIS_STATIC_STRING || '';
 const PAKASIR_SLUG = process.env.PAKASIR_SLUG || '';
 const PAKASIR_API_KEY = process.env.PAKASIR_API_KEY || '';
 const WEBHOOK_PORT = Number(process.env.QRIS_WEBHOOK_PORT || 3099);
 const WEBHOOK_SECRET = process.env.QRIS_WEBHOOK_SECRET || '';
 const INVOICE_TTL = 30 * 60 * 1000;
-const MANUAL_WINDOW = 6 * 3600 * 1000;
+const MAX_TRIES = 3;
+const MIN_REF_LEN = 12;
 const PAID_RX = /^(completed|paid|success|settlement)$/i;
 const rp = (n) => `Rp ${Number(n).toLocaleString('id-ID')}`;
 
+// Salin 3 gambar QR ke ./assets/ dengan nama: qris_1.png (Rp1.000), qris_2.png (Rp5.000), qris_3.png (Rp10.000)
+const QR_DIR = path.join(process.cwd(), 'assets');
+
 export const PREMIUM_PACKAGES = {
-  1: { days: 2, price: 1000, label: '2 Hari' },
-  2: { days: 14, price: 5000, label: '2 Minggu' },
-  3: { days: 30, price: 10000, label: '1 Bulan' },
+  1: { days: 2, price: 1000, label: '2 Hari', img: 'qris_1.png' },
+  2: { days: 14, price: 5000, label: '2 Minggu', img: 'qris_2.png' },
+  3: { days: 30, price: 10000, label: '1 Bulan', img: 'qris_3.png' },
 };
 
 export const LIMIT_EXEMPT_COMMANDS = new Set([
@@ -109,7 +113,6 @@ async function settleInvoice(dbMemory, saveMemory, orderId, source) {
   return inv;
 }
 
-/** Sumber kebenaran pembayaran otomatis: tanya langsung ke Pakasir (server-to-server). */
 async function verifyPakasir(inv) {
   if (!PAKASIR_SLUG || !PAKASIR_API_KEY || inv?.gatewayMode !== 'PAKASIR') return false;
   const url = `https://app.pakasir.com/api/transactiondetail?project=${encodeURIComponent(PAKASIR_SLUG)}&amount=${inv.amount}&order_id=${encodeURIComponent(inv.orderId)}&api_key=${encodeURIComponent(PAKASIR_API_KEY)}`;
@@ -126,12 +129,8 @@ const qrUrl = (data) => `https://api.qrserver.com/v1/create-qr-code/?size=450x45
 async function createQrisInvoice(dbMemory, saveMemory, senderNum, notifyJid, pkg) {
   dbMemory.pendingInvoices = (dbMemory.pendingInvoices || []).filter((i) => i.phone !== senderNum);
 
-  let code;
-  do { code = Math.floor(Math.random() * 899) + 101; }
-  while (dbMemory.pendingInvoices.some((i) => i.amount === pkg.price + code));
-
   const orderId = `PREM-${senderNum.slice(-4)}-${Date.now().toString().slice(-6)}`;
-  let qrisImageUrl = '';
+  let qrImage = null; // { url } | { buffer }
   let gatewayMode = 'MANUAL';
 
   if (PAKASIR_SLUG && PAKASIR_API_KEY) {
@@ -143,27 +142,30 @@ async function createQrisInvoice(dbMemory, saveMemory, senderNum, notifyJid, pkg
       }, 12000);
       const data = await res.json();
       const qr = data?.payment?.payment_number || data?.qr_string;
-      if (qr) { qrisImageUrl = qrUrl(qr); gatewayMode = 'PAKASIR'; }
+      if (qr) { qrImage = { url: qrUrl(qr) }; gatewayMode = 'PAKASIR'; }
     } catch {}
   }
 
-  if (!qrisImageUrl) qrisImageUrl = STATIC_QRIS_URL || (STATIC_QRIS_PAYLOAD ? qrUrl(STATIC_QRIS_PAYLOAD) : '');
+  if (!qrImage) {
+    const buffer = await fsPromises.readFile(path.join(QR_DIR, pkg.img)).catch(() => null);
+    if (buffer) qrImage = { buffer };
+  }
 
   const invoice = {
     orderId,
     phone: senderNum,
     notifyJid,
-    amount: gatewayMode === 'PAKASIR' ? pkg.price : pkg.price + code,
+    amount: pkg.price,
     days: pkg.days,
     gatewayMode,
     manual: gatewayMode !== 'PAKASIR',
-    ref: '',
+    tries: 0,
     createdAt: Date.now(),
     expiresAt: Date.now() + INVOICE_TTL,
   };
   dbMemory.pendingInvoices.push(invoice);
   await saveMemory();
-  return { invoice, qrisImageUrl };
+  return { invoice, qrImage };
 }
 
 /* ───────────── Watcher, auto-expire, webhook ───────────── */
@@ -234,7 +236,6 @@ export function startPremiumAndQrisWatcher(sock, dbMemory, saveMemory) {
       try {
         const orderId = String(JSON.parse(body || '{}').order_id || '');
         const inv = (dbMemory.pendingInvoices || []).find((i) => i.orderId === orderId);
-        // payload webhook TIDAK dipercaya; wajib lolos verifikasi API Pakasir
         if (inv && (await verifyPakasir(inv))) {
           await settleInvoice(dbMemory, saveMemory, orderId, 'Webhook Pakasir');
           return out(200, { ok: true });
@@ -246,6 +247,10 @@ export function startPremiumAndQrisWatcher(sock, dbMemory, saveMemory) {
 }
 
 /* ───────────── Handler perintah ───────────── */
+
+const HOW_TO_ID =
+  `📍 *Cara cek ID Transaksi:*\n` +
+  `DANA → *Aktivitas/Riwayat* → pilih transaksi → *Rincian/Detail Transaksi* → salin *ID Transaksi*`;
 
 export async function handlePremiumCommand({ sock, jid, senderNum, isOwner, isSenderAdmin, cmd, param = '', msg, dbMemory, saveMemory }) {
   if (!PREMIUM_COMMANDS.includes(cmd)) return false;
@@ -276,38 +281,46 @@ export async function handlePremiumCommand({ sock, jid, senderNum, isOwner, isSe
       );
       return true;
     }
-    const { invoice, qrisImageUrl } = await createQrisInvoice(dbMemory, saveMemory, senderNum, jid, pkg);
+    const { invoice, qrImage } = await createQrisInvoice(dbMemory, saveMemory, senderNum, jid, pkg);
     const caption =
       `💳 *PEMBAYARAN PREMIUM (${pkg.label})*\n\n` +
-      `• ID Transaksi: \`${invoice.orderId}\`\n` +
-      `• Total Transfer: *${rp(invoice.amount)}* _(harus persis)_\n` +
+      `• ID Invoice: \`${invoice.orderId}\`\n` +
+      `• Total Bayar: *${rp(invoice.amount)}*\n` +
       (invoice.manual
-        ? `• DANA: *${DANA_NUMBER}*\n\nSetelah transfer, kirim:\n\`.konfirmasi <6 digit terakhir ID transaksi DANA>\`\nOwner memverifikasi mutasi, lalu Premium aktif.\n⏱️ Tagihan berlaku 30 menit.`
+        ? `• Scan QR *(khusus DANA)* atau transfer ke DANA *${DANA_NUMBER}*\n\n` +
+          `Setelah bayar, kirim:\n\`.konfirmasi <ID Transaksi DANA>\`\n\n${HOW_TO_ID}\n\n` +
+          `✅ Premium aktif *otomatis* setelah ID dikirim.\n⏱️ Tagihan berlaku 30 menit.`
         : `\n✅ Premium aktif *otomatis* setelah pembayaran terverifikasi (±1 menit).\n⏱️ Tagihan berlaku 30 menit.`);
-    await sock.sendMessage(jid, qrisImageUrl ? { image: { url: qrisImageUrl }, caption } : { text: caption }, { quoted: msg });
+    await sock.sendMessage(jid, qrImage ? { image: qrImage.buffer || { url: qrImage.url }, caption } : { text: caption }, { quoted: msg });
     return true;
   }
 
   if (cmd === 'konfirmasi') {
-    const ref = param.replace(/\D/g, '');
+    const ref = param.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
     const inv = (dbMemory.pendingInvoices || []).find((i) => i.phone === senderNum && i.manual);
-    if (!inv) { await send('📭 Tidak ada tagihan manual aktif. Ketik `.qris` dulu.'); return true; }
-    if (inv.ref) { await send('⏳ Bukti sudah dikirim, menunggu verifikasi owner.'); return true; }
-    if (ref.length < 6) { await send('⚠️ Contoh: `.konfirmasi 123456` (6+ digit terakhir ID transaksi DANA)'); return true; }
+    if (!inv) { await send('📭 Tidak ada tagihan aktif. Ketik `.qris` dulu.'); return true; }
+    if (inv.tries >= MAX_TRIES) { await send('⛔ Percobaan habis. Buat tagihan baru dengan `.qris`.'); return true; }
+    if (ref.length < MIN_REF_LEN) {
+      await send(`⚠️ Contoh: \`.konfirmasi <ID Transaksi>\` (min ${MIN_REF_LEN} karakter, kirim ID lengkap)\n\n${HOW_TO_ID}`);
+      return true;
+    }
     dbMemory.usedRefs ||= {};
-    if (dbMemory.usedRefs[ref]) { await send('⛔ Referensi ini sudah pernah dipakai.'); return true; }
+    if (dbMemory.usedRefs[ref]) {
+      inv.tries += 1;
+      await saveMemory();
+      await send(`⛔ ID ini sudah pernah dipakai. Sisa percobaan: ${MAX_TRIES - inv.tries}`);
+      return true;
+    }
     dbMemory.usedRefs[ref] = inv.orderId;
     inv.ref = ref;
-    inv.expiresAt = Date.now() + MANUAL_WINDOW;
-    await saveMemory();
-    if (OWNER_NUMBER) {
+    const done = await settleInvoice(dbMemory, saveMemory, inv.orderId, 'ID Transaksi DANA');
+    if (done && OWNER_NUMBER) {
       await sock.sendMessage(`${OWNER_NUMBER}@s.whatsapp.net`, {
         text:
-          `🔔 *KONFIRMASI BAYAR*\n+${senderNum}\nNominal: ${rp(inv.amount)}\nRef DANA: ${ref}\nPaket: ${inv.days} hari\n\n` +
-          `Cocokkan dengan mutasi DANA, lalu:\n\`.accprem ${inv.orderId}\``,
+          `🔔 *PREMIUM AKTIF OTOMATIS*\n+${senderNum}\nNominal: ${rp(done.amount)}\nPaket: ${done.days} hari\nID DANA: ${ref}\n\n` +
+          `Cocokkan dengan mutasi DANA. Jika palsu:\n\`.delprem ${senderNum}\``,
       }).catch(() => {});
     }
-    await send('⏳ Bukti diterima, menunggu verifikasi owner.');
     return true;
   }
 
@@ -315,7 +328,7 @@ export async function handlePremiumCommand({ sock, jid, senderNum, isOwner, isSe
     if (isUserPremium(user)) { await send(`✅ Akun *+${senderNum}* PREMIUM AKTIF (${formatRemainingTime(user.premiumUntil - Date.now())}).`); return true; }
     const inv = (dbMemory.pendingInvoices || []).find((i) => i.phone === senderNum);
     await send(inv
-      ? `⏳ Tagihan \`${inv.orderId}\` *${rp(inv.amount)}* (${inv.days} hari) ${inv.ref ? 'menunggu verifikasi owner' : 'menunggu pembayaran'}.`
+      ? `⏳ Tagihan \`${inv.orderId}\` *${rp(inv.amount)}* (${inv.days} hari) menunggu pembayaran.\nKirim \`.konfirmasi <ID Transaksi>\` setelah bayar.`
       : '📭 Tidak ada tagihan aktif. Ketik `.qris` untuk melihat paket.');
     return true;
   }
