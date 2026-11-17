@@ -8,10 +8,25 @@ import { downloadContentFromMessage } from '@whiskeysockets/baileys';
 
 const execFileAsync = promisify(execFile);
 
-/* Opsional (env): YTDLP_BIN, YTDLP_COOKIES, YTDLP_PROXY, COBALT_API, COBALT_KEY */
+/* .env: YTDLP_PROXY=http://user:pass@ip:port | YTDLP_COOKIES=./cookies.txt | YTDLP_BIN | COBALT_API | COBALT_KEY */
 const MB = 1024 * 1024;
 const LOCAL_BIN = path.join(process.cwd(), 'bin', process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
 let YTDLP = process.env.YTDLP_BIN || (existsSync(LOCAL_BIN) ? LOCAL_BIN : 'yt-dlp');
+
+const PROXY = (process.env.YTDLP_PROXY || '').trim();
+const COOKIES_SRC = process.env.YTDLP_COOKIES ? path.resolve(process.env.YTDLP_COOKIES) : '';
+if (COOKIES_SRC && !existsSync(COOKIES_SRC)) console.warn('[yt-dlp] YTDLP_COOKIES tidak ditemukan:', COOKIES_SRC);
+if (PROXY && !/^(https?|socks5h?|socks4a?):\/\//i.test(PROXY)) console.warn('[yt-dlp] YTDLP_PROXY harus diawali http:// atau socks5://');
+const ytNet = (cookieFile = '') => [...(PROXY ? ['--proxy', PROXY] : []), ...(cookieFile ? ['--cookies', cookieFile] : [])];
+// yt-dlp menulis ulang file cookies → selalu pakai salinan sementara
+async function cookieCopy() {
+  if (!COOKIES_SRC || !existsSync(COOKIES_SRC)) return '';
+  const p = path.join(os.tmpdir(), `ck_${Date.now()}_${Math.random().toString(36).slice(2, 7)}.txt`);
+  await fsPromises.copyFile(COOKIES_SRC, p).catch(() => {});
+  return existsSync(p) ? p : '';
+}
+const ytClients = () => (COOKIES_SRC ? [null, 'web_safari', 'mweb', 'tv'] : [null, 'tv,web_safari', 'android_vr', 'mweb']);
+
 const MAX_BYTES = 1900 * MB;
 const VIDEO_INLINE_MAX = 60 * MB;
 const MAX_PARALLEL = 3;
@@ -65,7 +80,7 @@ const sec = (title, rows) => `*${title}*\n${rows.map(([u, d]) => `• \`.${u}\`$
 export const DOWNLOAD_MENU = [
   '*╭┈───〔 📥 MENU DOWNLOAD 〕┈───⊷*\n' +
   '*│* _Chat pribadi: tempel link langsung otomatis terunduh_\n' +
-  '*│* _Grup: link WAJIB diawali perintah (mis. `tiktok <link>`), link polos dihapus_\n' +
+  '*│* _Grup: link WAJIB diawali perintah (mis. `.tiktok <link>`), link polos dihapus_\n' +
   '*│* _Reaksi ⏳ → ✅ menandakan proses selesai_\n' +
   '*╰───────────────────────⊷*',
   ...MENU_SECTIONS.map(([title, rows]) => sec(title, rows)),
@@ -163,7 +178,7 @@ function cacheSet(key, val) {
   while (mediaCache.size > 15) mediaCache.delete(mediaCache.keys().next().value);
 }
 
-/* ───────────────────────── Engine: yt-dlp (auto-update) ───────────────────────── */
+/* ───────────────────────── Engine: yt-dlp (auto-update, proxy, cookies) ───────────────────────── */
 
 const YT_ASSET = { win32: 'yt-dlp.exe', darwin: 'yt-dlp_macos', linux: process.arch === 'arm64' ? 'yt-dlp_linux_aarch64' : 'yt-dlp_linux' }[process.platform] || 'yt-dlp';
 const OUTDATED = /requested format|n challenge|nsig|js runtime|deno|signature|player response|HTTP Error 403|unable to extract|Unsupported URL/i;
@@ -193,30 +208,50 @@ async function probe() {
   }
 }
 
-/** yt-dlp -U; jika gagal (pip / tidak ada / read-only) → unduh binary standalone terbaru ke ./bin */
+/** yt-dlp -U → pip install -U yt-dlp → binary standalone terbaru (fetch / curl, lewat proxy bila ada). */
 export function updateYtdlp(force = false, minGap = 3600000) {
   if (updating) return updating;
   if (!force && Date.now() - lastUpdate < minGap) return Promise.resolve(false);
   lastUpdate = Date.now();
   updating = (async () => {
     try {
-      let viaSelf = false;
+      let how = '';
       try {
-        const { stdout, stderr } = await execFileAsync(YTDLP, ['-U'], { timeout: 180000 });
-        viaSelf = !/pip|pypi|package manager|wheel|ERROR/i.test(`${stdout}${stderr}`);
+        const { stdout, stderr } = await execFileAsync(YTDLP, ['-U', ...ytNet()], { timeout: 180000 });
+        if (!/pip|pypi|package manager|wheel|ERROR/i.test(`${stdout}${stderr}`)) how = '-U';
       } catch {}
-      if (!viaSelf) {
-        const f = await fetchFile(`https://github.com/yt-dlp/yt-dlp/releases/latest/download/${YT_ASSET}`, '', { maxBytes: 300 * MB });
-        if (f.buffer.length < MB) throw new Error('bad binary');
+
+      if (!how) {
+        const prev = YTDLP;
+        outer: for (const py of ['python3', 'python', 'py']) {
+          for (const extra of [['--break-system-packages'], []]) {
+            const ok = await execFileAsync(py, ['-m', 'pip', 'install', '-U', ...extra, ...(PROXY ? ['--proxy', PROXY] : []), 'yt-dlp'], { timeout: 240000 }).then(() => true, () => false);
+            if (!ok) continue;
+            YTDLP = process.env.YTDLP_BIN || 'yt-dlp';
+            if (await probe()) { how = 'pip'; break outer; }
+            YTDLP = prev;
+          }
+        }
+      }
+
+      if (!how) {
+        const url = `https://github.com/yt-dlp/yt-dlp/releases/latest/download/${YT_ASSET}`;
         await fsPromises.mkdir(path.dirname(LOCAL_BIN), { recursive: true });
         const tmpBin = `${LOCAL_BIN}.new`;
-        await fsPromises.writeFile(tmpBin, f.buffer, { mode: 0o755 });
+        let buf = null;
+        try { buf = (await fetchFile(url, '', { maxBytes: 300 * MB })).buffer; } catch {}
+        if (buf && buf.length > MB) await fsPromises.writeFile(tmpBin, buf, { mode: 0o755 });
+        else await execFileAsync('curl', ['-fsSL', ...(PROXY ? ['--proxy', PROXY] : []), '-o', tmpBin, url], { timeout: 240000 });
+        if ((await fsPromises.stat(tmpBin)).size < MB) throw new Error('bad binary');
+        await fsPromises.chmod(tmpBin, 0o755);
         await fsPromises.rename(tmpBin, LOCAL_BIN);
         YTDLP = LOCAL_BIN;
+        how = 'binary lokal';
       }
+
       ytdlpOk = await probe();
       ytdlpCheckedAt = Date.now();
-      console.log('[yt-dlp] update selesai, via', viaSelf ? '-U' : 'binary lokal');
+      console.log('[yt-dlp] update selesai, via', how);
       return ytdlpOk;
     } catch (e) {
       console.error('[yt-dlp] update gagal:', e?.message);
@@ -247,7 +282,10 @@ function ytErrorHint(raw = lastYtError) {
   const e = String(raw || '');
   if (!e) return '';
   if (/tidak terpasang/i.test(e)) return 'yt-dlp belum terpasang di server.';
-  if (/sign in to confirm|not a bot|cookies|login required/i.test(e)) return 'YouTube meminta verifikasi login (bot check). Set `YTDLP_COOKIES` ke file cookies.txt atau pakai `YTDLP_PROXY`.';
+  if (/sign in to confirm|not a bot|login required|cookies/i.test(e)) return COOKIES_SRC
+    ? 'Cookies YouTube kedaluwarsa. Export ulang cookies.txt dari browser yang login (akun cadangan) lalu ganti file `YTDLP_COOKIES`.'
+    : 'YouTube meminta login (bot check). Isi `YTDLP_COOKIES=./cookies.txt` dan/atau `YTDLP_PROXY` (IP residensial).';
+  if (/proxy|tunnel|407|connection refused|unable to connect|name resolution/i.test(e)) return 'Proxy gagal / salah format. Cek `YTDLP_PROXY=http://user:pass@ip:port`.';
   if (/confirm your age|age[- ]restricted|inappropriate/i.test(e)) return 'Video dibatasi usia (butuh cookies akun).';
   if (/private|members-only|membership/i.test(e)) return 'Video privat / khusus member.';
   if (OUTDATED.test(e)) return 'yt-dlp usang / butuh JS runtime. Bot sudah mencoba update otomatis, coba lagi sebentar.';
@@ -262,7 +300,6 @@ const ytFailText = (what = 'video YouTube') => {
   return `❌ Gagal mengunduh ${what}.${hint ? `\nℹ️ ${hint}` : '\nCoba lagi, atau pakai resolusi lebih rendah, mis. `.ytmp4 <link> 360`.'}`;
 };
 
-const YT_CLIENTS = [null, 'tv,web_safari', 'android_vr', 'mweb'];
 const isYouTubeUrl = (u = '') => /(^|\/\/|\.)(youtube\.com|youtu\.be)/i.test(u);
 
 async function ytdlpOnce(url, { audio, height, signal }, client) {
@@ -271,6 +308,7 @@ async function ytdlpOnce(url, { audio, height, signal }, client) {
   const mine = async () => (await fsPromises.readdir(os.tmpdir())).filter((f) => f.startsWith(`${base}.`));
   const h = `height<=${height}`;
   const ff = await hasFfmpeg();
+  const ck = await cookieCopy();
   const fmt = audio
     ? (ff ? ['-f', 'bestaudio/best', '-x', '--audio-format', 'mp3', '--audio-quality', '128K'] : ['-f', 'bestaudio[ext=m4a]/bestaudio/best'])
     : (ff
@@ -282,8 +320,7 @@ async function ytdlpOnce(url, { audio, height, signal }, client) {
     '--max-filesize', `${Math.floor(MAX_BYTES / MB)}M`,
     '--socket-timeout', '15', '--retries', '3', '--concurrent-fragments', '4',
     '-o', tmp(`${base}.%(ext)s`),
-    ...(process.env.YTDLP_COOKIES ? ['--cookies', process.env.YTDLP_COOKIES] : []),
-    ...(process.env.YTDLP_PROXY ? ['--proxy', process.env.YTDLP_PROXY] : []),
+    ...ytNet(ck),
     ...(client ? ['--extractor-args', `youtube:player_client=${client}`] : []),
     ...(ytJs && isYouTubeUrl(url) ? ['--remote-components', 'ejs:github', '--js-runtimes', `node:${process.execPath}`, '--js-runtimes', 'deno'] : []),
     ...fmt,
@@ -311,13 +348,14 @@ async function ytdlpOnce(url, { audio, height, signal }, client) {
     console.error(`[yt-dlp${client ? `:${client}` : ''}]`, lastYtError.slice(0, 300));
     return null;
   } finally {
+    if (ck) await fsPromises.unlink(ck).catch(() => {});
     for (const f of await mine().catch(() => [])) await fsPromises.unlink(tmp(f)).catch(() => {});
   }
 }
 
 async function ytdlp(url, { audio = false, height = 720, signal } = {}, retried = false) {
   if (!(await hasYtdlp())) return null;
-  const clients = isYouTubeUrl(url) ? YT_CLIENTS : [null];
+  const clients = isYouTubeUrl(url) ? ytClients() : [null];
   for (const client of clients) {
     if (signal?.aborted) return null;
     const r = await ytdlpOnce(url, { audio, height, signal }, client);
@@ -332,11 +370,11 @@ async function ytdlp(url, { audio = false, height = 720, signal } = {}, retried 
 
 async function searchViaYtdlp(query) {
   if (!(await hasYtdlp())) return [];
+  const ck = await cookieCopy();
   try {
     const { stdout } = await execFileAsync(YTDLP, [
       '--no-warnings', '--flat-playlist', '-J',
-      ...(process.env.YTDLP_COOKIES ? ['--cookies', process.env.YTDLP_COOKIES] : []),
-      ...(process.env.YTDLP_PROXY ? ['--proxy', process.env.YTDLP_PROXY] : []),
+      ...ytNet(ck),
       `ytsearch6:${query}`,
     ], { timeout: 30000, maxBuffer: 10 * MB });
     return (JSON.parse(stdout)?.entries || [])
@@ -353,6 +391,8 @@ async function searchViaYtdlp(query) {
       }));
   } catch {
     return [];
+  } finally {
+    if (ck) await fsPromises.unlink(ck).catch(() => {});
   }
 }
 
