@@ -7,10 +7,9 @@ import pino from 'pino';
 
 import { mulaiWeb } from './web.js';
 import { restoreAuthFromGitHub, scheduleAuthBackupToGitHub, startGitHubLiveHotReload, setupGracefulShutdown } from './github_sync.js';
-import { SPOTIFY_LIVE_BUTTON_IDS, handleSpotifyLiveButton } from './spotify_live.js';
 import { ALL_GROUP_COMMANDS, GROUP_AUTO_ONLY_COMMANDS, GROUP_SECURITY_MENU, isSenderGroupAdmin, handleGroupMessageGuard, handleGroupCommand, handleGroupParticipantsUpdate, handleGroupJoinRequestEvent, startGroupAutomationScheduler, handleGroupThemeInteraction } from './group_automation.js';
 import { PREMIUM_COMMANDS, ensureUserRecord, checkAndConsumeDailyLimit, handlePremiumCommand, startPremiumAndQrisWatcher } from './premium_limit.js';
-import { fetchWithTimeout, fetchBuffer, extractUrl, downloadTikTok, downloadCapCut, searchYouTube, downloadYouTube, downloadSocialMedia, mediaBufferToWebpSticker, createBratSticker, urlOrTextToWebpSticker, extractAndDownloadViewOnce, sendNativeInteractiveButtons, panggilServerAISatSet, getAnimeImageUrl } from './engines.js';
+import { DOWNLOAD_COMMANDS, DOWNLOAD_MENU, handleDownloadCommand, handleDirectUrlAutoDownload, fetchWithTimeout, fetchBuffer, extractUrl, mediaBufferToWebpSticker, createBratSticker, urlOrTextToWebpSticker, extractAndDownloadViewOnce, sendNativeInteractiveButtons, panggilServerAISatSet, getAnimeImageUrl } from './engines.js';
 
 const PHONE = (process.env.PHONE_NUMBER || '').replace(/\D/g, '');
 const AUTH_DIR = process.env.AUTH_DIR || './auth';
@@ -30,23 +29,23 @@ let dbMemory = {
   version: 9.8, lastUpdateDate: '', updateLogs: [], users: {}, pendingInvoices: [],
   learnedWords: [], notes: {}, groupSettings: {}, gameHighScores: { kuroslash: {}, sonic: {} },
   botSettings: { mode: 'public', autoread: false, autotyping: true, customBotName: '' },
-  healthReport: { lastChecked: '-', summary: 'Modular Group Security + Clean Command Brain', details: {}, autoRepairs: [], totalRepairs: 0 },
+  healthReport: { lastChecked: '-', summary: 'Modular Group Security + Unified Download Engine', details: {}, autoRepairs: [], totalRepairs: 0 },
 };
 
 const MENU_CATEGORIES = {
   AI: ['ai', 'gpt', 'ask', 'tanya', 'gemini', 'chatgpt', 'simi', 'cerita', 'puisi', 'pantun', 'kode', 'coding', 'ringkas', 'memori', 'resetmemori'],
-  DOWNLOAD: ['tiktok', 'tt', 'ttmp3', 'ttslide', 'capcut', 'ytmp4', 'ytmp3', 'ytdl', 'video', 'play', 'play2', 'song', 'spotify', 'spotifylive', 'splive', 'yts', 'igdl', 'fb', 'twitter', 'mediafire', 'gdrive', 'gitclone', 'tts'],
   SEARCH: ['cuaca', 'wthr', 'setlokasi', 'lokasi', 'praytime', 'surah', 'wiki', 'npm', 'define', 'fakta', 'motivasi', 'kbbi'],
   ANIME: ['waifu', 'neko', 'shinobu', 'megumin', 'cuddle', 'cry', 'kiss', 'lick', 'bonk', 'yeet', 'blush', 'smile', 'highfive', 'handhold', 'nom', 'bite', 'glomp', 'slap', 'kill', 'kickanime', 'happy', 'wink', 'poke', 'cringe'],
   FUN: ['kuroslash', 'slash', 'sonic', 'speedydash', 'game', 'mathgame', 'tebakkata', 'suit', 'dice', 'coin', '8ball', 'rate', 'aura', 'sigma', 'rizz', 'vibe', 'npc', 'maincharacter', 'delulu', 'redflag', 'greenflag', 'compatibility', 'ship', 'roast', 'compliment', 'pickup', 'quote', 'joke', 'truth', 'dare', 'wyr', 'horoscope', 'hug', 'pat', 'wave', 'dance'],
   STICKER_LOGO: ['sticker', 'stiker', 's', 'brat', 'bratvid', 'bratvideo', 'ttp', 'attp', 'qc', 'animasi', 'linkvideo', 'font', 'fancy', 'logo', 'neon', 'gold', 'galaxy', 'glitch', 'matrix', 'graffiti', 'thunder'],
   TOOLS: ['rvo', 'rvop', 'vv', 'hitung', 'catat', 'catatan', 'terjemah', 'translate', 'id', 'getpp', 'getbio', 'gpass', 'qr', 'shorturl', 'waktu', 'base64', 'reverse', 'ssweb', 'fixsession'],
   OWNER: ['setnama', 'setname', 'botname', 'updatebio', 'block', 'unblock', 'blocklist', 'autoread', 'autotyping', 'mode', 'badwords', 'addkata', 'delkata', 'clean'],
-  SYSTEM: ['menu', 'help', 'allmenu', 'groupmenu', 'aimenu', 'downloadmenu', 'searchmenu', 'animemenu', 'funmenu', 'logomenu', 'toolsmenu', 'ownermenu', 'ping', 'ping2', 'speed', 'os', 'alive', 'runtime', 'uptime', 'owner', 'status', 'selftest', 'cekfitur', 'autorepair', 'update'],
+  SYSTEM: ['menu', 'help', 'allmenu', 'groupmenu', 'aimenu', 'downloadmenu', 'dlmenu', 'searchmenu', 'animemenu', 'funmenu', 'logomenu', 'toolsmenu', 'ownermenu', 'ping', 'ping2', 'speed', 'os', 'alive', 'runtime', 'uptime', 'owner', 'status', 'selftest', 'cekfitur', 'autorepair', 'update'],
 };
 
 const ALL_COMMANDS_SET = new Set([
   ...Object.values(MENU_CATEGORIES).flat(),
+  ...DOWNLOAD_COMMANDS,
   ...ALL_GROUP_COMMANDS,
   ...PREMIUM_COMMANDS,
 ]);
@@ -87,8 +86,8 @@ async function jalankanAuditFiturRealTime(manual = false) {
     summary: `${ALL_COMMANDS_SET.size}/${ALL_COMMANDS_SET.size} Fitur VALID & Modular Aktif`,
     details: {
       'Group Security & Auto': `✅ ${ALL_GROUP_COMMANDS.length} Perintah Aktif`,
+      'Download Engine': `✅ ${DOWNLOAD_COMMANDS.length} Perintah Aktif`,
       'Premium & QRIS': `✅ ${PREMIUM_COMMANDS.length} Perintah Aktif`,
-      'AI, Media & Tools': `✅ ${ALL_COMMANDS_SET.size - ALL_GROUP_COMMANDS.length - PREMIUM_COMMANDS.length} Perintah Aktif`,
       'Auto-Repair': `${serverAutoHeal.totalAutoRepairs}x perbaikan`,
     },
     autoRepairs: dbMemory.healthReport.autoRepairs || [],
@@ -176,7 +175,7 @@ async function jalankanEvolusiMandiri(paksaManual = false) {
   serverAutoHeal.isUpdating = true;
   dbMemory.version = Number((dbMemory.version + 0.1).toFixed(1));
   dbMemory.lastUpdateDate = hariIni;
-  const log = `v${dbMemory.version} (${hariIni}): Unified Group Security & Automation + Modular Command Brain.`;
+  const log = `v${dbMemory.version} (${hariIni}): Unified Group Security & Download Engine.`;
   dbMemory.updateLogs.unshift(log);
   await saveMemory();
   serverAutoHeal.isUpdating = false;
@@ -237,7 +236,6 @@ async function getSurahLengkap(no) {
 }
 
 const gameSessions = new Map();
-const lastPlaySession = new Map();
 const sentMessageCache = new Map();
 const lastReplyTextByJid = new Map();
 const retryCooldownByJid = new Map();
@@ -341,51 +339,6 @@ async function getCuacaKotaAkurat(cityName) {
   return null;
 }
 
-async function handleDirectUrlAutoDownload(sock, jid, url, msg) {
-  const lower = url.toLowerCase();
-  if (/tiktok\.com/i.test(lower)) {
-    const res = await downloadTikTok(url);
-    if (!res) return false;
-    if (res.type === 'image') {
-      for (const u of res.images.slice(0, 8)) {
-        const b = await fetchBuffer(u, 'https://www.tiktok.com/').catch(() => null);
-        if (b) await sock.sendMessage(jid, { image: b }, { quoted: msg });
-      }
-    } else if (res.videoUrl) {
-      const vBuf = await fetchBuffer(res.videoUrl, 'https://www.tiktok.com/').catch(() => null);
-      await sock.sendMessage(jid, vBuf ? { video: vBuf, caption: `🎬 *TikTok*\n${res.title || ''}` } : { video: { url: res.videoUrl }, caption: `🎬 *TikTok*\n${res.title || ''}` }, { quoted: msg });
-    }
-    return true;
-  }
-  if (/capcut\.com/i.test(lower)) {
-    const cc = await downloadCapCut(url);
-    if (!cc?.url) return false;
-    const vBuf = await fetchBuffer(cc.url, 'https://www.capcut.com/').catch(() => null);
-    await sock.sendMessage(jid, vBuf ? { video: vBuf, caption: `🎬 *${cc.title || 'CapCut'}*` } : { video: { url: cc.url }, caption: `🎬 *${cc.title || 'CapCut'}*` }, { quoted: msg });
-    return true;
-  }
-  if (/youtube\.com\/(watch|shorts)|youtu\.be\//i.test(lower)) {
-    const yt = await downloadYouTube(url, false);
-    if (!yt?.buffer) return false;
-    await sock.sendMessage(jid, { video: yt.buffer, caption: `🎬 *${yt.title || 'YouTube'}*` }, { quoted: msg });
-    return true;
-  }
-  const pf = [
-    [/instagram\.com/i, 'igdl'], [/facebook\.com|fb\.watch/i, 'fb'], [/twitter\.com|x\.com/i, 'twitter'],
-    [/mediafire\.com/i, 'mediafire'], [/drive\.google\.com/i, 'gdrive'],
-  ].find(([rx]) => rx.test(lower));
-  if (pf) {
-    const res = await downloadSocialMedia(url, pf[1]);
-    if (!res?.url) return false;
-    const buf = await fetchBuffer(res.url).catch(() => null);
-    if (!buf) await sock.sendMessage(jid, { text: `🔗 *Link Unduhan:* ${res.url}` }, { quoted: msg });
-    else if (pf[1] === 'mediafire' || pf[1] === 'gdrive') await sock.sendMessage(jid, { document: buf, fileName: res.filename || 'file', mimetype: 'application/octet-stream' }, { quoted: msg });
-    else await sock.sendMessage(jid, res.isImage ? { image: buf } : { video: buf }, { quoted: msg });
-    return true;
-  }
-  return false;
-}
-
 async function prosesSatuPesan(sock, msg) {
   try {
     if (!msg.message || msg.key.fromMe) return;
@@ -411,7 +364,6 @@ async function prosesSatuPesan(sock, msg) {
     if (isGroup && await handleGroupMessageGuard({ sock, jid, msg, rawText, textLower, senderParticipant: rawParticipant, senderNum, isSenderAdmin, isOwner, bot, dbMemory })) return;
 
     const cleanAction = textLower.replace(/^[.!/#]/, '').trim();
-    if (SPOTIFY_LIVE_BUTTON_IDS.has(cleanAction)) { await handleSpotifyLiveButton(sock, jid, cleanAction, msg); return; }
     if (cleanAction === 'stopgame' && gameSessions.has(jid)) { gameSessions.delete(jid); await sock.sendMessage(jid, { text: '🛑 Permainan dihentikan.' }, { quoted: msg }); return; }
 
     if (gameSessions.has(jid)) {
@@ -496,6 +448,7 @@ async function prosesSatuPesan(sock, msg) {
 
       if (await handlePremiumCommand({ sock, jid, senderNum, isOwner, isSenderAdmin, cmd, param, msg, dbMemory, saveMemory })) return;
       if (await handleGroupCommand({ sock, jid, isGroup, senderParticipant: rawParticipant, senderNum, isOwner, isSenderAdmin, cmd, param, unwrapped, msg, dbMemory, saveMemory })) return;
+      if (await handleDownloadCommand({ sock, jid, cmd, param, msg })) return;
 
       if (cmd === 'fixsession') {
         if (!isOwner && !isSenderAdmin) { await sock.sendMessage(jid, { text: '⛔ Perintah ini khusus Owner atau Admin Grup.' }, { quoted: msg }); return; }
@@ -537,6 +490,7 @@ async function prosesSatuPesan(sock, msg) {
               rows: [
                 { title: '📊 Cek Sisa Limit Harian', description: 'Lihat sisa kuota harian atau masa aktif Premium', id: 'limit' },
                 { title: '💳 Beli Premium QRIS 1 Minggu', description: 'Aktivasi otomatis Unlimited selama 7 hari', id: 'qris' },
+                { title: '📥 Menu Download', description: 'TikTok, YouTube, Spotify, IG, FB & File', id: 'downloadmenu' },
                 { title: '🛡️ Menu Keamanan Grup', description: 'Anti-Link, Auto ACC, Kick, Mute & Filter Member', id: 'keamanangrup' },
                 { title: '⚙️ Panel Otomatisasi Grup', description: 'Jadwal kegiatan, Welcome & Auto Buka/Tutup', id: 'panelgrup' },
                 { title: '📋 Daftar Lengkap Semua Fitur', description: 'Tampilkan seluruh perintah bot', id: 'allmenu' },
@@ -552,8 +506,8 @@ async function prosesSatuPesan(sock, msg) {
             },
           ],
           buttons: [
+            { text: '📥 Menu Download', id: 'downloadmenu' },
             { text: '🛡️ Keamanan Grup', id: 'keamanangrup' },
-            { text: '💳 QRIS Premium', id: 'qris' },
             { text: '📋 Semua Fitur', id: 'allmenu' },
           ],
         }, msg);
@@ -563,15 +517,15 @@ async function prosesSatuPesan(sock, msg) {
       if (cmd === 'allmenu') {
         let out = `*╭┈───〔 ${bot.userName} - SEMUA FITUR 〕┈───⊷*\n*├✦ Owner:* ${OWNER_NAME}\n*├✦ Total Aktif:* ${ALL_COMMANDS_SET.size} Fitur\n*╰───────────────────⊷*\n\n`;
         for (const [cat, list] of Object.entries(MENU_CATEGORIES)) {
-          if (cat !== 'GROUP') out += formatCategoryBox(cat, list) + '\n';
+          out += formatCategoryBox(cat, list) + '\n';
         }
-        out += GROUP_SECURITY_MENU + '\n\n' + formatCategoryBox('GROUP_AUTOMATION', GROUP_AUTO_ONLY_COMMANDS) + '\n' + formatCategoryBox('LIMIT_PREMIUM', PREMIUM_COMMANDS) + '\n';
+        out += DOWNLOAD_MENU + '\n\n' + GROUP_SECURITY_MENU + '\n\n' + formatCategoryBox('GROUP_AUTOMATION', GROUP_AUTO_ONLY_COMMANDS) + '\n' + formatCategoryBox('LIMIT_PREMIUM', PREMIUM_COMMANDS) + '\n';
         await sock.sendMessage(jid, { text: out, contextInfo: { forwardingScore: 999, isForwarded: true } }, { quoted: msg });
         return;
       }
 
       if (cmd === 'groupmenu') { await sock.sendMessage(jid, { text: GROUP_SECURITY_MENU }, { quoted: msg }); return; }
-      const subMenus = { aimenu: 'AI', downloadmenu: 'DOWNLOAD', searchmenu: 'SEARCH', animemenu: 'ANIME', funmenu: 'FUN', logomenu: 'STICKER_LOGO', toolsmenu: 'TOOLS', ownermenu: 'OWNER' };
+      const subMenus = { aimenu: 'AI', searchmenu: 'SEARCH', animemenu: 'ANIME', funmenu: 'FUN', logomenu: 'STICKER_LOGO', toolsmenu: 'TOOLS', ownermenu: 'OWNER' };
       if (subMenus[cmd]) { await sock.sendMessage(jid, { text: formatCategoryBox(subMenus[cmd], MENU_CATEGORIES[subMenus[cmd]]) }, { quoted: msg }); return; }
 
       // Sistem & Status
@@ -607,84 +561,6 @@ async function prosesSatuPesan(sock, msg) {
         return;
       }
 
-      // Downloader & Play
-      if (['tiktok', 'tt', 'ttmp3', 'ttslide'].includes(cmd)) {
-        const u = extractUrl(param);
-        if (!u) { await sock.sendMessage(jid, { text: `⚠️ Contoh: \`${cmd} https://vt.tiktok.com/...\`` }, { quoted: msg }); return; }
-        const res = await downloadTikTok(u);
-        if (!res) { await sock.sendMessage(jid, { text: '❌ Gagal mengunduh TikTok.' }, { quoted: msg }); return; }
-        if (cmd === 'ttmp3' && res.musicUrl) {
-          const buf = await fetchBuffer(res.musicUrl, 'https://www.tiktok.com/').catch(() => null);
-          if (buf) await sock.sendMessage(jid, { audio: buf, mimetype: 'audio/mpeg' }, { quoted: msg });
-        } else if (res.type === 'image') {
-          for (const imgU of res.images.slice(0, 8)) {
-            const b = await fetchBuffer(imgU, 'https://www.tiktok.com/').catch(() => null);
-            if (b) await sock.sendMessage(jid, { image: b }, { quoted: msg });
-          }
-        } else if (res.videoUrl) {
-          const vBuf = await fetchBuffer(res.videoUrl, 'https://www.tiktok.com/').catch(() => null);
-          await sock.sendMessage(jid, vBuf ? { video: vBuf, caption: `🎬 *TikTok HD*\n${res.title}` } : { video: { url: res.videoUrl }, caption: `🎬 *TikTok HD*\n${res.title}` }, { quoted: msg });
-        }
-        return;
-      }
-      if (cmd === 'capcut') {
-        const u = extractUrl(param);
-        if (!u) { await sock.sendMessage(jid, { text: '⚠️ Contoh: `capcut https://www.capcut.com/tv2/...`' }, { quoted: msg }); return; }
-        const cc = await downloadCapCut(u);
-        if (!cc?.url) { await sock.sendMessage(jid, { text: '❌ Video CapCut tidak ditemukan atau privat.' }, { quoted: msg }); return; }
-        const vBuf = await fetchBuffer(cc.url, 'https://www.capcut.com/').catch(() => null);
-        await sock.sendMessage(jid, vBuf ? { video: vBuf, caption: `🎬 *${cc.title}*` } : { video: { url: cc.url }, caption: `🎬 *${cc.title}*` }, { quoted: msg });
-        return;
-      }
-      if (['ytmp4', 'ytmp3', 'ytdl', 'video'].includes(cmd)) {
-        const u = extractUrl(param) || lastPlaySession.get(jid)?.url;
-        if (!u) { await sock.sendMessage(jid, { text: `⚠️ Contoh: \`${cmd} https://youtu.be/...\`` }, { quoted: msg }); return; }
-        const isAud = cmd === 'ytmp3';
-        const yt = await downloadYouTube(u, isAud);
-        await sock.sendMessage(jid, yt?.buffer ? (isAud ? { audio: yt.buffer, mimetype: 'audio/mpeg' } : { video: yt.buffer, caption: `🎬 *${yt.title}*` }) : { text: '❌ Gagal mengunduh media YouTube.' }, { quoted: msg });
-        return;
-      }
-      if (['play', 'play2', 'song', 'spotify', 'spotifylive', 'splive'].includes(cmd)) {
-        if (!param) { await sock.sendMessage(jid, { text: '⚠️ Contoh: `play komang raim laode`' }, { quoted: msg }); return; }
-        let trackUrl = extractUrl(param), trackTitle = param, trackDuration = '';
-        if (!trackUrl) {
-          const list = await searchYouTube(param);
-          if (!list?.length) { await sock.sendMessage(jid, { text: '❌ Lagu tidak ditemukan.' }, { quoted: msg }); return; }
-          ({ url: trackUrl, title: trackTitle, duration: trackDuration } = list[0]);
-        }
-        lastPlaySession.set(jid, { url: trackUrl, title: trackTitle });
-        await sock.sendMessage(jid, { text: `🎵 *Memutar:* ${trackTitle}${trackDuration ? ` — ${trackDuration}` : ''}\n⏳ _Mengirim audio..._` }, { quoted: msg });
-        const ytAudio = await downloadYouTube(trackUrl, true);
-        await sock.sendMessage(jid, ytAudio?.buffer ? { audio: ytAudio.buffer, mimetype: 'audio/mpeg', ptt: false } : { text: `❌ Gagal mengambil file audio untuk *${trackTitle}*.` }, { quoted: msg });
-        return;
-      }
-      if (cmd === 'yts' && param) {
-        const list = await searchYouTube(param);
-        await sock.sendMessage(jid, { text: list.length ? list.map((v, i) => `${i + 1}. *${v.title}* — ${v.duration}\n🔗 ${v.url}`).join('\n\n') : '❌ Tidak ditemukan.' }, { quoted: msg });
-        return;
-      }
-      if (['igdl', 'fb', 'twitter', 'mediafire', 'gdrive'].includes(cmd)) {
-        const u = extractUrl(param);
-        if (!u) { await sock.sendMessage(jid, { text: `⚠️ Contoh: \`${cmd} https://...\`` }, { quoted: msg }); return; }
-        const res = await downloadSocialMedia(u, cmd);
-        if (!res?.url) { await sock.sendMessage(jid, { text: '❌ Tautan gagal diunduh.' }, { quoted: msg }); return; }
-        const buf = await fetchBuffer(res.url).catch(() => null);
-        if (!buf) await sock.sendMessage(jid, { text: `🔗 ${res.url}` }, { quoted: msg });
-        else if (cmd === 'mediafire' || cmd === 'gdrive') await sock.sendMessage(jid, { document: buf, fileName: res.filename, mimetype: 'application/octet-stream' }, { quoted: msg });
-        else await sock.sendMessage(jid, res.isImage ? { image: buf } : { video: buf }, { quoted: msg });
-        return;
-      }
-      if (cmd === 'gitclone') {
-        const m = param.match(/github\.com\/([^/]+)\/([^/\s]+)/i);
-        if (m) await sock.sendMessage(jid, { document: { url: `https://github.com/${m[1]}/${m[2].replace(/\.git$/, '')}/archive/refs/heads/main.zip` }, fileName: `${m[2]}.zip`, mimetype: 'application/zip' }, { quoted: msg });
-        return;
-      }
-      if (cmd === 'tts' && param) {
-        const buf = await fetchBuffer(`https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(param.slice(0, 200))}&tl=id&client=tw-ob`).catch(() => null);
-        if (buf) await sock.sendMessage(jid, { audio: buf, mimetype: 'audio/mpeg', ptt: true }, { quoted: msg });
-        return;
-      }
-
       // Search, Cuaca & Islami
       if (cmd === 'setlokasi' || cmd === 'lokasi') {
         if (!param) {
@@ -701,7 +577,7 @@ async function prosesSatuPesan(sock, msg) {
       if (cmd === 'cuaca' || cmd === 'wthr') {
         const userRec = ensureUserRecord(dbMemory, senderNum);
         const targetCity = param ? param.replace(/^di\s+/i, '').trim() : userRec.city || 'Jakarta';
-        if (param && !userRec.city) { userRec.city = targetCity; await saveMemory(); }
+        if (param && !userRec.city) { userObj.city = targetCity; await saveMemory(); }
         await sock.sendMessage(jid, { text: (await getCuacaKotaAkurat(targetCity)) || '❌ Kota tidak ditemukan.' }, { quoted: msg });
         return;
       }
