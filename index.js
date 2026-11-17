@@ -26,10 +26,10 @@ const bot = {
 };
 
 let dbMemory = {
-  version: 9.8, lastUpdateDate: '', updateLogs: [], users: {}, pendingInvoices: [],
+  version: 9.9, lastUpdateDate: '', updateLogs: [], users: {}, pendingInvoices: [],
   learnedWords: [], notes: {}, groupSettings: {}, gameHighScores: { kuroslash: {}, sonic: {} },
   botSettings: { mode: 'public', autoread: false, autotyping: true, customBotName: '' },
-  healthReport: { lastChecked: '-', summary: 'Modular Group Security + Unified Download Engine', details: {}, autoRepairs: [], totalRepairs: 0 },
+  healthReport: { lastChecked: '-', summary: 'Modular Group Security + Multi-Engine Downloader', details: {}, autoRepairs: [], totalRepairs: 0 },
 };
 
 const MENU_CATEGORIES = {
@@ -175,7 +175,7 @@ async function jalankanEvolusiMandiri(paksaManual = false) {
   serverAutoHeal.isUpdating = true;
   dbMemory.version = Number((dbMemory.version + 0.1).toFixed(1));
   dbMemory.lastUpdateDate = hariIni;
-  const log = `v${dbMemory.version} (${hariIni}): Unified Group Security & Download Engine.`;
+  const log = `v${dbMemory.version} (${hariIni}): Multi-Engine Downloader (yt-dlp + Race API) & Group Security.`;
   dbMemory.updateLogs.unshift(log);
   await saveMemory();
   serverAutoHeal.isUpdating = false;
@@ -433,10 +433,12 @@ async function prosesSatuPesan(sock, msg) {
     const cmd = args[0].toLowerCase();
     const param = args.slice(1).join(' ').trim();
 
+    // Auto-download tautan langsung (TikTok, CapCut, YouTube, IG, FB, Twitter/X, MediaFire, GDrive)
     if (!ALL_COMMANDS_SET.has(cmd)) {
       const directUrl = extractUrl(rawText);
-      if (directUrl && /(tiktok\.com|instagram\.com|capcut\.com|youtube\.com\/(watch|shorts)|youtu\.be\/|facebook\.com|fb\.watch|twitter\.com|x\.com|mediafire\.com|drive\.google\.com)/i.test(directUrl)) {
-        if (!(await checkAndConsumeDailyLimit({ sock, jid, senderNum, isOwner, isSenderAdmin, cmd: 'autodownload', msg, dbMemory, saveMemory })).allowed) return;
+      if (directUrl) {
+        const limitCheck = await checkAndConsumeDailyLimit({ sock, jid, senderNum, isOwner, isSenderAdmin, cmd: 'autodownload', msg, dbMemory, saveMemory });
+        if (!limitCheck.allowed) return;
         if (dbMemory.botSettings.autotyping) sock.sendPresenceUpdate('composing', jid).catch(() => {});
         if (await handleDirectUrlAutoDownload(sock, jid, directUrl, msg)) return;
       }
@@ -556,7 +558,7 @@ async function prosesSatuPesan(sock, msg) {
       if (cmd === 'memori') { const f = dbMemory.users[senderNum]?.facts || []; await sock.sendMessage(jid, { text: f.length ? `🧠 *Ingatan:*\n• ${f.join('\n• ')}` : '🧠 Memori kosong.' }, { quoted: msg }); return; }
       if (cmd === 'resetmemori') { if (dbMemory.users[senderNum]) dbMemory.users[senderNum].facts = []; await saveMemory(); await sock.sendMessage(jid, { text: '✅ Memori direset.' }, { quoted: msg }); return; }
       if (MENU_CATEGORIES.AI.includes(cmd)) {
-        if (!param) { await sock.sendMessage(jid, { text: `⚠️ Contoh: \`${cmd} jelaskan cara kerja AI\`` }, { quoted: msg }); return; }
+        if (!param) { await sock.sendMessage(jid, { text: `⚠️ Contoh: \`.${cmd} jelaskan cara kerja AI\`` }, { quoted: msg }); return; }
         await sock.sendMessage(jid, { text: (await panggilServerAISatSet(param, `Kamu adalah ${bot.userName}. Jawab singkat, cerdas, dan akurat dalam Bahasa Indonesia.`)) || '⏳ Server AI sibuk, coba ulangi.' }, { quoted: msg });
         return;
       }
@@ -565,7 +567,7 @@ async function prosesSatuPesan(sock, msg) {
       if (cmd === 'setlokasi' || cmd === 'lokasi') {
         if (!param) {
           const curCity = ensureUserRecord(dbMemory, senderNum).city;
-          await sock.sendMessage(jid, { text: curCity ? `📍 Lokasi kamu saat ini: *${curCity}*\nKetik \`lokasi di <kota baru>\` untuk mengubah.` : '⚠️ Contoh: `lokasi di bandung`' }, { quoted: msg });
+          await sock.sendMessage(jid, { text: curCity ? `📍 Lokasi kamu saat ini: *${curCity}*\nKetik \`.lokasi di <kota baru>\` untuk mengubah.` : '⚠️ Contoh: `.lokasi di bandung`' }, { quoted: msg });
           return;
         }
         const cleanCity = param.replace(/^di\s+/i, '').trim();
@@ -577,7 +579,7 @@ async function prosesSatuPesan(sock, msg) {
       if (cmd === 'cuaca' || cmd === 'wthr') {
         const userRec = ensureUserRecord(dbMemory, senderNum);
         const targetCity = param ? param.replace(/^di\s+/i, '').trim() : userRec.city || 'Jakarta';
-        if (param && !userRec.city) { userObj.city = targetCity; await saveMemory(); }
+        if (param && !userRec.city) { userRec.city = targetCity; await saveMemory(); }
         await sock.sendMessage(jid, { text: (await getCuacaKotaAkurat(targetCity)) || '❌ Kota tidak ditemukan.' }, { quoted: msg });
         return;
       }
@@ -602,7 +604,7 @@ async function prosesSatuPesan(sock, msg) {
       if (cmd === 'game') { gameSessions.set(jid, { type: 'angka', answer: Math.floor(Math.random() * 10) + 1 }); await sock.sendMessage(jid, { text: '🎮 *Tebak Angka 1 sampai 10*\nKirim tebakanmu!' }, { quoted: msg }); return; }
       if (cmd === 'mathgame') { const a = Math.floor(Math.random() * 25) + 5, b = Math.floor(Math.random() * 25) + 5; gameSessions.set(jid, { type: 'math', answer: a + b }); await sock.sendMessage(jid, { text: `🧮 Berapa *${a} + ${b}*?` }, { quoted: msg }); return; }
       if (cmd === 'tebakkata') { gameSessions.set(jid, { type: 'kata', answer: 'peta' }); await sock.sendMessage(jid, { text: '🧩 Punya gunung tapi tidak punya pohon, punya kota tapi tidak punya rumah. Apakah aku?' }, { quoted: msg }); return; }
-      if (cmd === 'suit') { const p = ['batu', 'gunting', 'kertas'], u = param.toLowerCase(); await sock.sendMessage(jid, { text: p.includes(u) ? `✊✌️✋ Kamu: *${u}* | Bot: *${p[Math.floor(Math.random() * 3)]}*` : '⚠️ Contoh: `suit batu`' }, { quoted: msg }); return; }
+      if (cmd === 'suit') { const p = ['batu', 'gunting', 'kertas'], u = param.toLowerCase(); await sock.sendMessage(jid, { text: p.includes(u) ? `✊✌️✋ Kamu: *${u}* | Bot: *${p[Math.floor(Math.random() * 3)]}*` : '⚠️ Contoh: `.suit batu`' }, { quoted: msg }); return; }
       if (cmd === 'dice') { await sock.sendMessage(jid, { text: `🎲 Dadu: *${Math.floor(Math.random() * 6) + 1}*` }, { quoted: msg }); return; }
       if (cmd === 'coin') { await sock.sendMessage(jid, { text: `🪙 Koin: *${Math.random() < 0.5 ? 'ANGKA' : 'GAMBAR'}*` }, { quoted: msg }); return; }
       if (cmd === '8ball') { await sock.sendMessage(jid, { text: `🎱 *${['Ya pasti!', 'Mungkin iya.', 'Coba lagi.', 'Tidak.'][Math.floor(Math.random() * 4)]}*` }, { quoted: msg }); return; }
@@ -641,7 +643,7 @@ async function prosesSatuPesan(sock, msg) {
         await sock.sendMessage(target, vo.type === 'audio' ? { audio: vo.buffer, mimetype: 'audio/mpeg', ptt: true } : { [vo.type]: vo.buffer, caption: `👁️ RVO\n${vo.caption}` });
         return;
       }
-      if (cmd === 'hitung' && param) { const r = safeEvaluateMath(param); await sock.sendMessage(jid, { text: r === null ? '⚠️ Format perhitungan tidak valid. Contoh: `hitung (25 + 15) * 2`' : `🧮 *${param}* = *${r}*` }, { quoted: msg }); return; }
+      if (cmd === 'hitung' && param) { const r = safeEvaluateMath(param); await sock.sendMessage(jid, { text: r === null ? '⚠️ Format perhitungan tidak valid. Contoh: `.hitung (25 + 15) * 2`' : `🧮 *${param}* = *${r}*` }, { quoted: msg }); return; }
       if (cmd === 'catat' && param) { (dbMemory.notes[jid] ||= []).push(param); await saveMemory(); await sock.sendMessage(jid, { text: '📝 Tersimpan!' }, { quoted: msg }); return; }
       if (cmd === 'catatan') { const l = dbMemory.notes[jid] || []; await sock.sendMessage(jid, { text: l.length ? l.map((v, i) => `${i + 1}. ${v}`).join('\n') : '📭 Kosong.' }, { quoted: msg }); return; }
       if ((cmd === 'terjemah' || cmd === 'translate') && args[1] && args[2]) { await sock.sendMessage(jid, { text: (await panggilServerAISatSet(`Terjemahkan ke ${args[1]}: ${args.slice(2).join(' ')}`, 'Terjemahkan saja.')) || '-' }, { quoted: msg }); return; }
@@ -719,7 +721,7 @@ async function start() {
   console.log(`\n🤖 ${bot.userName} v${dbMemory.version} — ${ALL_COMMANDS_SET.size} FITUR AKTIF\n`);
 
   const sock = makeWASocket({
-    version, auth: state, logger: pino({ level: 'silent' }), browser: ['WHUXEN Bot', 'Chrome', '9.8.0'],
+    version, auth: state, logger: pino({ level: 'silent' }), browser: ['WHUXEN Bot', 'Chrome', '9.9.0'],
     printQRInTerminal: false, getMessage: async (key) => sentMessageCache.get(key.id) || { conversation: '' },
   });
 
