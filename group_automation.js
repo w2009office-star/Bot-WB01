@@ -22,6 +22,7 @@ export const GROUP_SECURITY_MENU =
   `*╭┈───〔 🛡️ MENU KEAMANAN GRUP 〕┈───⊷*\n` +
   `*│* _@nomor bisa tag atau ketik 628xxx_\n` +
   `*│* _👑 VVIP: admin grup kebal kick & demote_\n` +
+  `*│* _📥 Link downloader (TikTok, YT, IG, dll) tidak dihapus anti-link_\n` +
   `*╰───────────────────────⊷*\n\n` +
   `*🔒 PROTEKSI CHAT*\n` +
   `• \`.antilink on/off\`\n` +
@@ -234,6 +235,22 @@ function pruneSpamTracker(now) {
   }
 }
 
+// 📥 Link dari platform ini dianggap permintaan download (perintah bot / auto-download), bukan spam link
+const DOWNLOAD_HOSTS = /^(?:[\w-]+\.)*(tiktok\.com|capcut\.com|youtube\.com|youtu\.be|instagram\.com|facebook\.com|fb\.watch|fb\.com|twitter\.com|x\.com|mediafire\.com|drive\.google\.com|github\.com|open\.spotify\.com)$/i;
+
+// true = pesan berisi link, dan SEMUA link-nya berasal dari platform downloader
+function isDownloadLinkMessage(text) {
+  const urls = String(text).match(/(?:https?:\/\/|www\.)[^\s<>"]+/gi) || [];
+  if (!urls.length) return false;
+  return urls.every((u) => {
+    try {
+      return DOWNLOAD_HOSTS.test(new URL(/^https?:/i.test(u) ? u : `https://${u}`).hostname);
+    } catch {
+      return false;
+    }
+  });
+}
+
 function detectViolation({ text, lower, cfg, bot, dbMemory, jid, spamKey }) {
   if (cfg.antivirtek || cfg.antibug) {
     const combining = (text.match(/[\u0300-\u036f]/g) || []).length;
@@ -259,8 +276,12 @@ function detectViolation({ text, lower, cfg, bot, dbMemory, jid, spamKey }) {
   }
 
   if (cfg.antilink) {
-    const blocked = (bot?.blockedDomains || []).map((d) => String(d ?? '').toLowerCase().trim()).filter(Boolean);
-    if (/(https?:\/\/|www\.|chat\.whatsapp\.com|wa\.me\/)/i.test(text) || blocked.some((d) => lower.includes(d))) return 'link';
+    // Link downloader (mis. `.tiktok https://vt.tiktok.com/...` atau link yang ditempel langsung)
+    // dibiarkan agar bisa diproses bot. Link lain tetap dihapus.
+    if (!isDownloadLinkMessage(text)) {
+      const blocked = (bot?.blockedDomains || []).map((d) => String(d ?? '').toLowerCase().trim()).filter(Boolean);
+      if (/(https?:\/\/|www\.|chat\.whatsapp\.com|wa\.me\/)/i.test(text) || blocked.some((d) => lower.includes(d))) return 'link';
+    }
   }
   return null;
 }
