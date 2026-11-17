@@ -7,21 +7,17 @@ import { downloadContentFromMessage } from '@whiskeysockets/baileys';
 
 const execFileAsync = promisify(execFile);
 
-/* ───────────────────────── Konfigurasi ─────────────────────────
- * Opsional (environment variable):
- *   YTDLP_BIN      → path yt-dlp (default: "yt-dlp")
- *   YTDLP_COOKIES  → path cookies.txt (membantu YouTube/IG yang minta login)
- *   COBALT_API     → URL instance cobalt v10 milik sendiri (mis. https://cobalt.domainmu.com)
- *   COBALT_KEY     → API key cobalt (jika instance memakainya)
- */
+/* Opsional (env): YTDLP_BIN, YTDLP_COOKIES, COBALT_API, COBALT_KEY */
 const YTDLP = process.env.YTDLP_BIN || 'yt-dlp';
-const MAX_BYTES = 95 * 1024 * 1024;          // batas aman dokumen WhatsApp
-const VIDEO_INLINE_MAX = 60 * 1024 * 1024;   // di atas ini video dikirim sebagai dokumen
-const MAX_PARALLEL = 3;                      // unduhan bersamaan (agar bot tidak berat)
+const MB = 1024 * 1024;
+const MAX_BYTES = 1900 * MB;          // batas dokumen WhatsApp (±2GB)
+const VIDEO_INLINE_MAX = 60 * MB;     // di atas ini video dikirim sebagai dokumen
+const MAX_PARALLEL = 3;
+const YT_TIMEOUT = 3 * 3600 * 1000;   // yt-dlp boleh berjalan hingga 3 jam (tanpa batas durasi video)
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 
-const lastPlaySession = new Map();   // jid → { url, title }
-const lastSearch = new Map();        // jid → hasil .yts (untuk pilih angka)
+const lastPlaySession = new Map(); // jid → { url, title }
+const lastSearch = new Map();      // jid → hasil .yts
 
 export const DOWNLOAD_COMMANDS = [
   'tiktok', 'tt', 'ttmp3', 'ttslide', 'capcut',
@@ -30,33 +26,25 @@ export const DOWNLOAD_COMMANDS = [
   'downloadmenu', 'dlmenu',
 ];
 
-export const DOWNLOAD_MENU =
-  `*╭┈───〔 📥 MENU DOWNLOAD 〕┈───⊷*\n` +
-  `*│* _Tempel link langsung di chat juga otomatis terunduh_\n` +
-  `*│* _Reaksi ⏳ → ✅ menandakan proses selesai_\n` +
-  `*╰───────────────────────⊷*\n\n` +
-  `*🎵 MUSIK & YOUTUBE*\n` +
-  `• \`.play <judul>\` — audio + kartu info\n` +
-  `• \`.play2 <judul>\` — versi video\n` +
-  `• \`.spotify <judul/link>\`\n` +
-  `• \`.ytmp3 <link/judul/angka>\`\n` +
-  `• \`.ytmp4 <link/judul> [360|480|720|1080]\`\n` +
-  `• \`.yts <judul>\` — lalu \`.ytmp3 2\` untuk pilih hasil ke-2\n\n` +
-  `*📱 SOSIAL MEDIA*\n` +
-  `• \`.tiktok <link>\` (video & slide)\n` +
-  `• \`.ttmp3 <link>\`\n` +
-  `• \`.ttslide <link>\`\n` +
-  `• \`.capcut <link>\`\n` +
-  `• \`.igdl <link>\`\n` +
-  `• \`.fb <link>\`\n` +
-  `• \`.twitter <link>\`\n\n` +
-  `*📁 FILE & SUARA*\n` +
-  `• \`.mediafire <link>\`\n` +
-  `• \`.gdrive <link>\`\n` +
-  `• \`.gitclone <link repo>\`\n` +
-  `• \`.tts [en|id|ja...] <teks>\``;
+const sec = (title, rows) => `*${title}*\n${rows.map(([c, d]) => `• \`.${c}\`${d ? ` — ${d}` : ''}`).join('\n')}`;
+export const DOWNLOAD_MENU = [
+  '*╭┈───〔 📥 MENU DOWNLOAD 〕┈───⊷*\n' +
+  '*│* _Chat pribadi: tempel link langsung otomatis terunduh_\n' +
+  '*│* _Grup: link WAJIB diawali perintah (mis. `.tiktok <link>`), link polos dihapus_\n' +
+  '*│* _Reaksi ⏳ → ✅ menandakan proses selesai_\n' +
+  '*╰───────────────────────⊷*',
+  sec('🎵 MUSIK & YOUTUBE', [
+    ['play <judul>', 'audio + kartu info'], ['play2 <judul>', 'versi video'], ['spotify <judul/link>'],
+    ['ytmp3 <link/judul/angka>'], ['ytmp4 <link/judul> [360|480|720|1080]'], ['yts <judul>', 'lalu `.ytmp3 2` untuk pilih hasil ke-2'],
+  ]),
+  sec('📱 SOSIAL MEDIA', [
+    ['tiktok <link>', 'video & slide'], ['ttmp3 <link>'], ['ttslide <link>'], ['capcut <link>'],
+    ['igdl <link>'], ['fb <link>'], ['twitter <link>'],
+  ]),
+  sec('📁 FILE & SUARA', [['mediafire <link>'], ['gdrive <link>'], ['gitclone <link repo>'], ['tts [en|id|ja...] <teks>']]),
+].join('\n\n');
 
-/* ───────────────────────── Network & URL Helper ───────────────────────── */
+/* ───────────────────────── Helper jaringan ───────────────────────── */
 
 export async function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {
   const controller = new AbortController();
@@ -74,47 +62,43 @@ async function fetchJson(url, options = {}, timeoutMs = 15000) {
   return res.json();
 }
 
-/** Unduh file lengkap dengan nama file & content-type asli (batas ukuran dijaga). */
+/** Unduh file lengkap dengan nama file & content-type asli. */
 export async function fetchFile(url, referer = '', { maxBytes = MAX_BYTES, rejectHtml = false } = {}) {
   const headers = { 'User-Agent': UA, ...(referer ? { Referer: referer } : {}) };
   const res = await fetchWithTimeout(url, { headers, redirect: 'follow' }, 30000);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const contentType = (res.headers.get('content-type') || '').split(';')[0].trim();
   if (rejectHtml && contentType.includes('text/html')) throw new Error('NOT_A_FILE');
-  const len = Number(res.headers.get('content-length') || 0);
-  if (len > maxBytes) throw new Error('FILE_TOO_BIG');
+  if (Number(res.headers.get('content-length') || 0) > maxBytes) throw new Error('FILE_TOO_BIG');
   const buffer = Buffer.from(await res.arrayBuffer());
   if (buffer.length > maxBytes) throw new Error('FILE_TOO_BIG');
   const cd = res.headers.get('content-disposition') || '';
-  let fileName = '';
   const m = cd.match(/filename\*=UTF-8''([^;]+)/i) || cd.match(/filename="?([^";]+)"?/i);
+  let fileName = '';
   if (m) { try { fileName = decodeURIComponent(m[1]); } catch { fileName = m[1]; } }
   return { buffer, contentType, fileName };
 }
 
-export async function fetchBuffer(url, referer = '') {
-  return (await fetchFile(url, referer)).buffer;
-}
+export const fetchBuffer = async (url, referer = '') => (await fetchFile(url, referer)).buffer;
 
 export function extractUrl(text = '') {
   const m = String(text).match(/https?:\/\/[^\s<>"{}|\\^`[\]]+/i);
   return m ? m[0].replace(/[.,!?)]+$/, '') : '';
 }
 
-const safeName = (s = 'file', max = 80) =>
-  String(s).replace(/[\\/:*?"<>|\n\r]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max) || 'file';
+const safeName = (s = 'file', max = 80) => String(s).replace(/[\\/:*?"<>|\n\r]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max) || 'file';
 
 const EXT_MIME = {
   mp4: 'video/mp4', mp3: 'audio/mpeg', m4a: 'audio/mp4', zip: 'application/zip', rar: 'application/vnd.rar',
   '7z': 'application/x-7z-compressed', pdf: 'application/pdf', apk: 'application/vnd.android.package-archive',
   jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', txt: 'text/plain',
 };
-const mimeFor = (name = '', fallback = 'application/octet-stream') =>
-  EXT_MIME[path.extname(name).slice(1).toLowerCase()] ||
-  (fallback && fallback !== 'application/octet-stream' ? fallback : 'application/octet-stream');
+const mimeFor = (name = '', fallback = '') => EXT_MIME[path.extname(name).slice(1).toLowerCase()] || fallback || 'application/octet-stream';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const absTikwm = (u = '') => (u && u.startsWith('/') ? `https://www.tikwm.com${u}` : u);
+const absTikwm = (u = '') => (u.startsWith('/') ? `https://www.tikwm.com${u}` : u);
+const say = (sock, jid, msg, text) => sock.sendMessage(jid, { text }, { quoted: msg });
+const fail = async (sock, jid, msg, text) => { await say(sock, jid, msg, text); return false; };
 
 /** Jalankan beberapa engine bersamaan, ambil yang pertama berhasil, batalkan sisanya. */
 async function raceFirst(tasks) {
@@ -132,7 +116,7 @@ async function raceFirst(tasks) {
   }
 }
 
-/* ───────────────────────── Antrian & Cache ───────────────────────── */
+/* ───────────────────────── Antrian & cache ───────────────────────── */
 
 let active = 0;
 const waiting = [];
@@ -149,12 +133,12 @@ function cacheGet(key) {
   return v;
 }
 function cacheSet(key, val) {
-  if (!val?.buffer || val.buffer.length > 20 * 1024 * 1024) return;
+  if (!val?.buffer || val.buffer.length > 20 * MB) return;
   mediaCache.set(key, val);
   while (mediaCache.size > 15) mediaCache.delete(mediaCache.keys().next().value);
 }
 
-/* ───────────────────────── Engine: yt-dlp (lokal, paling stabil) ───────────────────────── */
+/* ───────────────────────── Engine: yt-dlp ───────────────────────── */
 
 let ytdlpOk;
 async function hasYtdlp() {
@@ -164,50 +148,41 @@ async function hasYtdlp() {
   return ytdlpOk;
 }
 
-async function ytdlp(url, { audio = false, height = 720, maxMB = 90, maxDuration = 0, signal } = {}) {
+async function ytdlp(url, { audio = false, height = 720, signal } = {}) {
   if (!(await hasYtdlp())) return null;
-  const id = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-  const base = `ytdlp_${id}`;
+  const base = `ytdlp_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const tmp = (f = '') => path.join(os.tmpdir(), f);
+  const mine = async () => (await fsPromises.readdir(os.tmpdir())).filter((f) => f.startsWith(`${base}.`));
+  const h = `height<=${height}`;
   const args = [
     '--no-playlist', '--no-warnings', '--no-simulate', '--no-part',
     '--print', 'after_move:%(title)s',
-    '--max-filesize', `${maxMB}M`,
+    '--max-filesize', `${Math.floor(MAX_BYTES / MB)}M`,
     '--socket-timeout', '15', '--retries', '2', '--concurrent-fragments', '4',
-    '-o', path.join(os.tmpdir(), `${base}.%(ext)s`),
+    '-o', tmp(`${base}.%(ext)s`),
+    ...(process.env.YTDLP_COOKIES ? ['--cookies', process.env.YTDLP_COOKIES] : []),
+    ...(audio
+      ? ['-f', 'bestaudio/best', '-x', '--audio-format', 'mp3', '--audio-quality', '128K']
+      : ['-f', `bv*[${h}][ext=mp4]+ba[ext=m4a]/b[${h}][ext=mp4]/bv*[${h}]+ba/b[${h}]/b`, '--merge-output-format', 'mp4']),
+    url,
   ];
-  if (maxDuration) args.push('--match-filter', `duration<=?${maxDuration}`);
-  if (process.env.YTDLP_COOKIES) args.push('--cookies', process.env.YTDLP_COOKIES);
-  if (audio) {
-    args.push('-f', 'bestaudio/best', '-x', '--audio-format', 'mp3', '--audio-quality', '128K');
-  } else {
-    args.push(
-      '-f', `bv*[height<=${height}][ext=mp4]+ba[ext=m4a]/b[height<=${height}][ext=mp4]/bv*[height<=${height}]+ba/b[height<=${height}]/b`,
-      '--merge-output-format', 'mp4',
-    );
-  }
-  args.push(url);
-
   try {
-    const { stdout } = await execFileAsync(YTDLP, args, { timeout: 150000, maxBuffer: 10 * 1024 * 1024, signal });
-    const title = stdout.trim().split('\n').filter(Boolean)[0] || 'Media';
-    const files = (await fsPromises.readdir(os.tmpdir())).filter((f) => f.startsWith(`${base}.`));
-    if (!files.length) return null;
+    const { stdout } = await execFileAsync(YTDLP, args, { timeout: YT_TIMEOUT, maxBuffer: 10 * MB, signal });
     let best = null;
-    for (const f of files) {
-      const st = await fsPromises.stat(path.join(os.tmpdir(), f)).catch(() => null);
+    for (const f of await mine()) {
+      const st = await fsPromises.stat(tmp(f)).catch(() => null);
       if (st && (!best || st.size > best.size)) best = { f, size: st.size };
     }
     if (!best || best.size < 1024) return null;
-    const buffer = await fsPromises.readFile(path.join(os.tmpdir(), best.f));
-    return { buffer, title, ext: path.extname(best.f).slice(1) };
+    return {
+      buffer: await fsPromises.readFile(tmp(best.f)),
+      title: stdout.trim().split('\n').filter(Boolean)[0] || 'Media',
+      ext: path.extname(best.f).slice(1),
+    };
   } catch {
     return null;
   } finally {
-    try {
-      for (const f of await fsPromises.readdir(os.tmpdir())) {
-        if (f.startsWith(`${base}.`)) await fsPromises.unlink(path.join(os.tmpdir(), f)).catch(() => {});
-      }
-    } catch {}
+    for (const f of await mine().catch(() => [])) await fsPromises.unlink(tmp(f)).catch(() => {});
   }
 }
 
@@ -216,9 +191,8 @@ async function ytdlp(url, { audio = false, height = 720, maxMB = 90, maxDuration
 async function cobaltResolve(url, { audio = false, height = 720 } = {}) {
   const base = (process.env.COBALT_API || '').replace(/\/$/, '');
   if (!base) return null;
-  const headers = { Accept: 'application/json', 'Content-Type': 'application/json' };
-  if (process.env.COBALT_KEY) headers.Authorization = `Api-Key ${process.env.COBALT_KEY}`;
-  const r = await fetchJson(base + '/', {
+  const headers = { Accept: 'application/json', 'Content-Type': 'application/json', ...(process.env.COBALT_KEY ? { Authorization: `Api-Key ${process.env.COBALT_KEY}` } : {}) };
+  const r = await fetchJson(`${base}/`, {
     method: 'POST',
     headers,
     body: JSON.stringify({ url, downloadMode: audio ? 'audio' : 'auto', audioFormat: 'mp3', videoQuality: String(height) }),
@@ -228,17 +202,20 @@ async function cobaltResolve(url, { audio = false, height = 720 } = {}) {
   return null;
 }
 
-/* ───────────────────────── Downloader Engines ───────────────────────── */
+const siputzx = (name, url, timeout = 15000) => fetchJson(`https://api.siputzx.my.id/api/d/${name}?url=${encodeURIComponent(url)}`, {}, timeout);
+const IMG_RX = /\.(jpg|jpeg|png|webp)(\?|$)/i;
+const kindOf = (u) => (IMG_RX.test(u) ? 'image' : 'video');
+
+/* ───────────────────────── Downloader ───────────────────────── */
 
 export async function downloadTikTok(url) {
-  // Engine 1: tikwm (ada retry saat kena rate limit)
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const json = await fetchJson('https://www.tikwm.com/api/', {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'User-Agent': UA },
         body: new URLSearchParams({ url, hd: '1' }),
-      }, 15000);
+      });
       const d = json?.data;
       if (!d) {
         if (/limit/i.test(json?.msg || '')) { await sleep(1300); continue; }
@@ -246,9 +223,7 @@ export async function downloadTikTok(url) {
       }
       const musicUrl = absTikwm(d.music || d.music_info?.play || '');
       const author = d.author?.nickname || d.author?.unique_id || '';
-      if (Array.isArray(d.images) && d.images.length) {
-        return { type: 'image', title: d.title || 'TikTok Slide', author, images: d.images.map(absTikwm), musicUrl };
-      }
+      if (Array.isArray(d.images) && d.images.length) return { type: 'image', title: d.title || 'TikTok Slide', author, images: d.images.map(absTikwm), musicUrl };
       const videoUrl = absTikwm(d.hdplay || d.play || d.wmplay || '');
       if (videoUrl) return { type: 'video', title: d.title || 'TikTok Video', author, videoUrl, musicUrl };
       break;
@@ -256,57 +231,47 @@ export async function downloadTikTok(url) {
       if (attempt === 0) await sleep(500);
     }
   }
-  // Engine 2: yt-dlp
-  const y = await ytdlp(url, { height: 720 });
-  if (y?.buffer) return { type: 'video', title: y.title, author: '', videoBuffer: y.buffer, musicUrl: '' };
-  return null;
+  const y = await ytdlp(url);
+  return y?.buffer ? { type: 'video', title: y.title, author: '', videoBuffer: y.buffer, musicUrl: '' } : null;
 }
 
 export async function downloadCapCut(url) {
   try {
-    const j = await fetchJson(`https://api.siputzx.my.id/api/d/capcut?url=${encodeURIComponent(url)}`, {}, 15000);
+    const j = await siputzx('capcut', url);
     const vUrl = j?.data?.videoUrl || j?.data?.url || j?.result?.url;
     if (vUrl) return { url: vUrl, title: j?.data?.title || j?.result?.title || 'CapCut Template' };
   } catch {}
   try {
-    const res = await fetchWithTimeout(url, { headers: { 'User-Agent': UA } }, 12000);
-    const html = await res.text();
+    const html = await (await fetchWithTimeout(url, { headers: { 'User-Agent': UA } }, 12000)).text();
     const m = html.match(/"video_url":"(https:[^"]+)"/) || html.match(/property="og:video"\s+content="([^"]+)"/);
     if (m?.[1]) return { url: m[1].replace(/\\u002F/g, '/').replace(/&amp;/g, '&'), title: 'CapCut Video' };
   } catch {}
   const y = await ytdlp(url);
-  if (y?.buffer) return { buffer: y.buffer, title: y.title || 'CapCut Video' };
-  return null;
+  return y?.buffer ? { buffer: y.buffer, title: y.title || 'CapCut Video' } : null;
 }
 
 export async function searchYouTube(query) {
   try {
     const res = await fetchWithTimeout(`https://www.youtube.com/results?search_query=${encodeURIComponent(query)}&hl=id`, {
       headers: { 'User-Agent': UA, 'Accept-Language': 'id,en;q=0.8' },
-    }, 15000);
-    const html = await res.text();
-    const match = html.match(/var ytInitialData = (\{.*?\});<\/script>/s);
+    });
+    const match = (await res.text()).match(/var ytInitialData = (\{.*?\});<\/script>/s);
     if (!match) return [];
-    const data = JSON.parse(match[1]);
-    const sections = data?.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents || [];
-    const results = [];
-    for (const sec of sections) {
-      for (const item of sec.itemSectionRenderer?.contents || []) {
-        const v = item.videoRenderer;
-        if (!v?.videoId) continue;
-        results.push({
-          id: v.videoId,
-          title: v.title?.runs?.[0]?.text || 'YouTube Video',
-          duration: v.lengthText?.simpleText || 'LIVE',
-          channel: v.ownerText?.runs?.[0]?.text || '',
-          views: v.viewCountText?.simpleText || '',
-          thumb: `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
-          url: `https://youtu.be/${v.videoId}`,
-        });
-        if (results.length >= 6) return results;
-      }
-    }
-    return results;
+    const sections = JSON.parse(match[1])?.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents || [];
+    return sections
+      .flatMap((s) => s.itemSectionRenderer?.contents || [])
+      .map((i) => i.videoRenderer)
+      .filter((v) => v?.videoId)
+      .slice(0, 6)
+      .map((v) => ({
+        id: v.videoId,
+        title: v.title?.runs?.[0]?.text || 'YouTube Video',
+        duration: v.lengthText?.simpleText || 'LIVE',
+        channel: v.ownerText?.runs?.[0]?.text || '',
+        views: v.viewCountText?.simpleText || '',
+        thumb: `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
+        url: `https://youtu.be/${v.videoId}`,
+      }));
   } catch {
     return [];
   }
@@ -314,24 +279,18 @@ export async function searchYouTube(query) {
 
 const ytId = (u = '') => (u.match(/(?:youtu\.be\/|v=|shorts\/|embed\/)([\w-]{11})/) || [])[1] || u;
 
-export async function downloadYouTube(url, audioOnly = false, { height = 720, maxDuration = 0 } = {}) {
-  const key = `${ytId(url)}|${audioOnly ? 'a' : 'v' + height}`;
+/** Tanpa batas durasi: video/audio berapa pun panjangnya, selama ≤ MAX_BYTES. */
+export async function downloadYouTube(url, audioOnly = false, { height = 720 } = {}) {
+  const key = `${ytId(url)}|${audioOnly ? 'a' : `v${height}`}`;
   const cached = cacheGet(key);
   if (cached) return cached;
 
-  // 1) yt-dlp lokal (paling stabil)
-  const y = await ytdlp(url, { audio: audioOnly, height, maxDuration });
-  if (y?.buffer) {
-    const out = { buffer: y.buffer, title: y.title };
-    cacheSet(key, out);
-    return out;
-  }
+  const y = await ytdlp(url, { audio: audioOnly, height });
+  let out = y?.buffer ? { buffer: y.buffer, title: y.title } : null;
 
-  // 2) API cadangan — dijalankan bersamaan, ambil tercepat
-  const type = audioOnly ? 'ytmp3' : 'ytmp4';
-  const out = await raceFirst([
+  out ||= await raceFirst([
     async () => {
-      const r = await fetchJson(`https://api.siputzx.my.id/api/d/${type}?url=${encodeURIComponent(url)}`, {}, 20000);
+      const r = await siputzx(audioOnly ? 'ytmp3' : 'ytmp4', url, 20000);
       const dl = r?.data?.dl || r?.data?.url || r?.result?.url;
       if (!dl) return null;
       const f = await fetchFile(dl, '', { rejectHtml: true });
@@ -348,36 +307,24 @@ export async function downloadYouTube(url, audioOnly = false, { height = 720, ma
   return out;
 }
 
-const IMG_RX = /\.(jpg|jpeg|png|webp)(\?|$)/i;
-
-/**
- * Mengembalikan { items:[{type,url?|buffer?,fileName?}], url, filename, isImage }
- * (url/filename/isImage = item pertama, agar kompatibel dengan kode lama)
- */
+/** → { items:[{type,url?|buffer?,fileName?}], url, filename, isImage } */
 export async function downloadSocialMedia(url, platform = '') {
   const p = platform.toLowerCase();
   let items = null;
 
   if (p === 'gdrive') {
-    const m = url.match(/\/d\/([\w-]+)/) || url.match(/[?&]id=([\w-]+)/);
-    if (m?.[1]) {
-      items = [{
-        type: 'document',
-        url: `https://drive.usercontent.google.com/download?id=${m[1]}&export=download&confirm=t`,
-        fileName: `gdrive_${m[1]}`,
-        rejectHtml: true,
-      }];
-    }
+    const id = (url.match(/\/d\/([\w-]+)/) || url.match(/[?&]id=([\w-]+)/) || [])[1];
+    if (id) items = [{ type: 'document', url: `https://drive.usercontent.google.com/download?id=${id}&export=download&confirm=t`, fileName: `gdrive_${id}`, rejectHtml: true }];
   } else if (p === 'mediafire') {
     items = await raceFirst([
       async () => {
-        const j = await fetchJson(`https://api.siputzx.my.id/api/d/mediafire?url=${encodeURIComponent(url)}`, {}, 15000);
+        const j = await siputzx('mediafire', url);
         const f = Array.isArray(j?.data) ? j.data[0] : (j?.data || j?.result);
         const dl = f?.downloadLink || f?.url || f?.link;
         return dl ? [{ type: 'document', url: dl, fileName: f?.fileName || f?.filename || f?.name }] : null;
       },
       async () => {
-        const html = await (await fetchWithTimeout(url, { headers: { 'User-Agent': UA } }, 15000)).text();
+        const html = await (await fetchWithTimeout(url, { headers: { 'User-Agent': UA } })).text();
         const m = html.match(/href="((?:https?:)?\/\/download\d*\.mediafire\.com[^"]+)"/i);
         if (!m) return null;
         const link = m[1].startsWith('//') ? `https:${m[1]}` : m[1];
@@ -385,65 +332,53 @@ export async function downloadSocialMedia(url, platform = '') {
       },
     ]);
   } else {
-    const apiMap = {
-      igdl: 'instagram', fb: 'facebook', twitter: 'twitter',
-    };
-    const apiName = {
-      igdl: 'igdl', fb: 'facebook', twitter: 'twitter',
-    }[p];
+    const apiName = { igdl: 'igdl', fb: 'facebook', twitter: 'twitter' }[p];
     items = await raceFirst([
       async () => {
         if (!apiName) return null;
-        const j = await fetchJson(`https://api.siputzx.my.id/api/d/${apiName}?url=${encodeURIComponent(url)}`, {}, 15000);
+        const j = await siputzx(apiName, url);
         const list = Array.isArray(j?.data) ? j.data : [j?.data || j?.result].filter(Boolean);
         const out = list
-          .map((x) => {
-            const u = typeof x === 'string' ? x : (x?.url || x?.hd || x?.sd || x?.downloadLink || '');
-            return u ? { type: IMG_RX.test(u) ? 'image' : 'video', url: u } : null;
-          })
+          .map((x) => (typeof x === 'string' ? x : x?.url || x?.hd || x?.sd || x?.downloadLink || ''))
           .filter(Boolean)
-          .slice(0, 10);
+          .slice(0, 10)
+          .map((u) => ({ type: kindOf(u), url: u }));
         return out.length ? out : null;
       },
       async (signal) => {
-        const y = await ytdlp(url, { height: 720, signal });
+        const y = await ytdlp(url, { signal });
         return y?.buffer ? [{ type: 'video', buffer: y.buffer, title: y.title }] : null;
       },
       async () => {
         const c = await cobaltResolve(url);
-        if (c?.url) return [{ type: IMG_RX.test(c.url) ? 'image' : 'video', url: c.url }];
-        if (c?.picker) return c.picker.slice(0, 10).map((x) => ({ type: x.type === 'photo' ? 'image' : 'video', url: x.url }));
-        return null;
+        if (c?.url) return [{ type: kindOf(c.url), url: c.url }];
+        return c?.picker?.slice(0, 10).map((x) => ({ type: x.type === 'photo' ? 'image' : 'video', url: x.url })) || null;
       },
     ]);
-    void apiMap;
   }
 
   if (!items?.length) return null;
   return { items, url: items[0].url, filename: items[0].fileName, isImage: items[0].type === 'image' };
 }
 
-/* ───────────────────────── Pengiriman Media ───────────────────────── */
+/* ───────────────────────── Pengiriman media ───────────────────────── */
 
-async function react(sock, jid, msg, emoji) {
-  try { await sock.sendMessage(jid, { react: { text: emoji, key: msg.key } }); } catch {}
-}
+const react = (sock, jid, msg, emoji) => sock.sendMessage(jid, { react: { text: emoji, key: msg.key } }).catch(() => {});
 
 async function sendItem(sock, jid, item, msg, caption = '') {
   const q = { quoted: msg };
   let { buffer, type, fileName, mimetype } = item;
 
   if (!buffer && item.url) {
-    const f = await fetchFile(item.url, item.referer || '', { rejectHtml: !!item.rejectHtml }).catch((e) => ({ err: e }));
-    if (f?.buffer) {
-      buffer = f.buffer;
-      fileName = fileName || f.fileName;
-      mimetype = mimetype || f.contentType;
-    } else if (f?.err?.message === 'FILE_TOO_BIG' || type === 'document') {
-      await sock.sendMessage(jid, { text: `📦 File terlalu besar untuk dikirim lewat WhatsApp.\n🔗 ${item.url}` }, q);
+    const f = await fetchFile(item.url, item.referer || '', { rejectHtml: !!item.rejectHtml }).catch((err) => ({ err }));
+    if (f.buffer) {
+      ({ buffer } = f);
+      fileName ||= f.fileName;
+      mimetype ||= f.contentType;
+    } else if (f.err?.message === 'FILE_TOO_BIG' || type === 'document') {
+      await say(sock, jid, msg, `📦 File terlalu besar untuk dikirim lewat WhatsApp.\n🔗 ${item.url}`);
       return true;
-    } else {
-      // Fallback: biarkan WhatsApp mengambil langsung dari URL
+    } else { // biarkan WhatsApp mengambil langsung dari URL
       await sock.sendMessage(jid, { [type]: { url: item.url }, ...(caption && type !== 'audio' ? { caption } : {}) }, q);
       return true;
     }
@@ -452,25 +387,17 @@ async function sendItem(sock, jid, item, msg, caption = '') {
 
   if (type === 'video' && buffer.length > VIDEO_INLINE_MAX) {
     type = 'document';
-    fileName = fileName || `${safeName(item.title || 'video')}.mp4`;
+    fileName ||= `${safeName(item.title || 'video')}.mp4`;
     mimetype = 'video/mp4';
   }
-
-  switch (type) {
-    case 'image':
-      await sock.sendMessage(jid, { image: buffer, ...(caption ? { caption } : {}) }, q);
-      break;
-    case 'video':
-      await sock.sendMessage(jid, { video: buffer, mimetype: 'video/mp4', ...(caption ? { caption } : {}) }, q);
-      break;
-    case 'audio':
-      await sock.sendMessage(jid, { audio: buffer, mimetype: 'audio/mpeg', ptt: !!item.ptt, ...(fileName ? { fileName } : {}) }, q);
-      break;
-    default: {
-      const name = safeName(fileName || 'file', 120);
-      await sock.sendMessage(jid, { document: buffer, fileName: name, mimetype: mimeFor(name, mimetype), ...(caption ? { caption } : {}) }, q);
-    }
-  }
+  const cap = caption ? { caption } : {};
+  const name = safeName(fileName || 'file', 120);
+  const content = {
+    image: { image: buffer, ...cap },
+    video: { video: buffer, mimetype: 'video/mp4', ...cap },
+    audio: { audio: buffer, mimetype: 'audio/mpeg', ptt: !!item.ptt, ...(fileName ? { fileName } : {}) },
+  }[type] || { document: buffer, fileName: name, mimetype: mimeFor(name, mimetype), ...cap };
+  await sock.sendMessage(jid, content, q);
   return true;
 }
 
@@ -481,56 +408,51 @@ async function sendItems(sock, jid, items, msg, caption = '') {
     const f = await fetchFile(it.url, it.referer || '', { rejectHtml: !!it.rejectHtml }).catch(() => null);
     if (f?.buffer) {
       it.buffer = f.buffer;
-      it.fileName = it.fileName || f.fileName;
-      it.mimetype = it.mimetype || f.contentType;
+      it.fileName ||= f.fileName;
+      it.mimetype ||= f.contentType;
     }
   }));
   let sent = 0;
   for (let i = 0; i < items.length; i++) {
-    const ok = await sendItem(sock, jid, items[i], msg, i === 0 ? caption : '').catch(() => false);
-    if (ok) sent++;
+    if (await sendItem(sock, jid, items[i], msg, i === 0 ? caption : '').catch(() => false)) sent++;
   }
   return sent > 0;
 }
 
-/* ───────────────────────── Deteksi Platform ───────────────────────── */
+/* ───────────────────────── Deteksi platform ───────────────────────── */
 
-function detectPlatform(url = '') {
-  const u = url.toLowerCase();
-  if (/(^|\/\/|\.)tiktok\.com/.test(u)) return 'tiktok';
-  if (/(^|\/\/|\.)capcut\.com/.test(u)) return 'capcut';
-  if (/(^|\/\/|\.)youtube\.com\/(watch|shorts|live)|(^|\/\/)youtu\.be\//.test(u) || /music\.youtube\.com\/watch/.test(u)) return 'youtube';
-  if (/(^|\/\/|\.)instagram\.com\/(p|reel|reels|tv|stories)\//.test(u)) return 'igdl';
-  if (/(^|\/\/|\.)facebook\.com|(^|\/\/)fb\.watch|(^|\/\/)fb\.com/.test(u)) return 'fb';
-  if (/(^|\/\/|\.)(twitter|x)\.com\/[^/]+\/status\//.test(u)) return 'twitter';
-  if (/(^|\/\/|\.)mediafire\.com/.test(u)) return 'mediafire';
-  if (/(^|\/\/)drive\.google\.com|(^|\/\/)docs\.google\.com\/uc/.test(u)) return 'gdrive';
-  return null;
-}
+const PLATFORMS = [
+  ['tiktok', /(^|\/\/|\.)tiktok\.com/],
+  ['capcut', /(^|\/\/|\.)capcut\.com/],
+  ['youtube', /(^|\/\/|\.)youtube\.com\/(watch|shorts|live)|(^|\/\/)youtu\.be\//],
+  ['igdl', /(^|\/\/|\.)instagram\.com\/(p|reel|reels|tv|stories)\//],
+  ['fb', /(^|\/\/|\.)facebook\.com|(^|\/\/)fb\.watch|(^|\/\/)fb\.com/],
+  ['twitter', /(^|\/\/|\.)(twitter|x)\.com\/[^/]+\/status\//],
+  ['mediafire', /(^|\/\/|\.)mediafire\.com/],
+  ['gdrive', /(^|\/\/)drive\.google\.com|(^|\/\/)docs\.google\.com\/uc/],
+];
+const detectPlatform = (url = '') => PLATFORMS.find(([, rx]) => rx.test(url.toLowerCase()))?.[0] || null;
 
-/* ───────────────────────── Handler Terpadu ───────────────────────── */
+/* ───────────────────────── Handler terpadu ───────────────────────── */
 
 async function runTikTok(sock, jid, url, msg, mode = 'auto') {
   const res = await downloadTikTok(url);
-  if (!res) { await sock.sendMessage(jid, { text: '❌ Gagal mengunduh TikTok. Pastikan link publik & coba lagi.' }, { quoted: msg }); return false; }
-  const cap = `🎬 *TikTok*${res.author ? ` — ${res.author}` : ''}\n${(res.title || '').slice(0, 300)}`;
+  if (!res) return fail(sock, jid, msg, '❌ Gagal mengunduh TikTok. Pastikan link publik & coba lagi.');
+  const title = (res.title || '').slice(0, 300);
 
   if (mode === 'audio') {
-    if (!res.musicUrl) { await sock.sendMessage(jid, { text: '❌ Audio tidak tersedia untuk video ini.' }, { quoted: msg }); return false; }
+    if (!res.musicUrl) return fail(sock, jid, msg, '❌ Audio tidak tersedia untuk video ini.');
     return sendItems(sock, jid, [{ type: 'audio', url: res.musicUrl, referer: 'https://www.tiktok.com/', fileName: `${safeName(res.title || 'tiktok')}.mp3` }], msg);
   }
   if (res.type === 'image') {
     const items = res.images.slice(0, 10).map((u) => ({ type: 'image', url: u, referer: 'https://www.tiktok.com/' }));
-    return sendItems(sock, jid, items, msg, `🖼️ *TikTok Slide* (${items.length} foto)\n${(res.title || '').slice(0, 200)}`);
+    return sendItems(sock, jid, items, msg, `🖼️ *TikTok Slide* (${items.length} foto)\n${title.slice(0, 200)}`);
   }
-  if (mode === 'slide') {
-    await sock.sendMessage(jid, { text: 'ℹ️ Link ini video biasa, bukan slide. Pakai `.tiktok` untuk video.' }, { quoted: msg });
-    return false;
-  }
+  if (mode === 'slide') return fail(sock, jid, msg, 'ℹ️ Link ini video biasa, bukan slide. Pakai `.tiktok` untuk video.');
   const item = res.videoBuffer
     ? { type: 'video', buffer: res.videoBuffer, title: res.title }
     : { type: 'video', url: res.videoUrl, referer: 'https://www.tiktok.com/', title: res.title };
-  return sendItems(sock, jid, [item], msg, cap);
+  return sendItems(sock, jid, [item], msg, `🎬 *TikTok*${res.author ? ` — ${res.author}` : ''}\n${title}`);
 }
 
 async function runGeneric(sock, jid, platform, url, msg, { height = 480 } = {}) {
@@ -538,246 +460,187 @@ async function runGeneric(sock, jid, platform, url, msg, { height = 480 } = {}) 
 
   if (platform === 'capcut') {
     const cc = await downloadCapCut(url);
-    if (!cc) { await sock.sendMessage(jid, { text: '❌ Video CapCut tidak ditemukan atau privat.' }, { quoted: msg }); return false; }
+    if (!cc) return fail(sock, jid, msg, '❌ Video CapCut tidak ditemukan atau privat.');
     const item = cc.buffer ? { type: 'video', buffer: cc.buffer } : { type: 'video', url: cc.url, referer: 'https://www.capcut.com/' };
     return sendItems(sock, jid, [item], msg, `🎬 *${cc.title || 'CapCut'}*`);
   }
 
   if (platform === 'youtube') {
-    const yt = await downloadYouTube(url, false, { height, maxDuration: 3600 });
-    if (!yt?.buffer) { await sock.sendMessage(jid, { text: '❌ Gagal mengunduh video YouTube (mungkin terlalu panjang/besar atau dibatasi).' }, { quoted: msg }); return false; }
+    const yt = await downloadYouTube(url, false, { height });
+    if (!yt?.buffer) return fail(sock, jid, msg, '❌ Gagal mengunduh video YouTube (terlalu besar atau dibatasi).');
     return sendItems(sock, jid, [{ type: 'video', buffer: yt.buffer, title: yt.title }], msg, `🎬 *${yt.title || 'YouTube'}*`);
   }
 
   const res = await downloadSocialMedia(url, platform);
-  if (!res?.items?.length) { await sock.sendMessage(jid, { text: '❌ Tautan gagal diunduh. Pastikan konten publik.' }, { quoted: msg }); return false; }
-  return sendItems(sock, jid, res.items, msg, platform === 'mediafire' || platform === 'gdrive' ? '' : '✅ Berhasil diunduh');
+  if (!res?.items?.length) return fail(sock, jid, msg, '❌ Tautan gagal diunduh. Pastikan konten publik.');
+  return sendItems(sock, jid, res.items, msg, ['mediafire', 'gdrive'].includes(platform) ? '' : '✅ Berhasil diunduh');
 }
+
+/** Jalankan dengan slot antrian + reaksi ⏳ → ✅/❌ */
+const withReaction = (sock, jid, msg, fn, onError) => withSlot(async () => {
+  await react(sock, jid, msg, '⏳');
+  let ok = false;
+  try { ok = await fn(); } catch (e) { await onError?.(e); }
+  await react(sock, jid, msg, ok ? '✅' : '❌');
+  return true;
+});
 
 export async function handleDirectUrlAutoDownload(sock, jid, url, msg) {
   const platform = detectPlatform(url);
   if (!platform) return false;
-  return withSlot(async () => {
-    await react(sock, jid, msg, '⏳');
-    try {
-      const ok = await runGeneric(sock, jid, platform, url, msg, { height: 480 });
-      await react(sock, jid, msg, ok ? '✅' : '❌');
-      return true; // sudah ditangani (walau gagal, pesan error sudah dikirim)
-    } catch {
-      await react(sock, jid, msg, '❌');
-      return false;
-    }
-  });
+  return withReaction(sock, jid, msg, () => runGeneric(sock, jid, platform, url, msg));
 }
 
-/* ───────────────────────── Resolusi Target YouTube ───────────────────────── */
+/* ───────────────────────── Perintah download ───────────────────────── */
 
 async function resolveYouTubeTarget(jid, param) {
   const text = (param || '').trim();
-  let link = extractUrl(text);
+  const link = extractUrl(text);
 
-  // Spotify → ambil judul via oEmbed lalu cari di YouTube
-  if (link && /open\.spotify\.com/i.test(link)) {
+  if (link && /open\.spotify\.com/i.test(link)) { // Spotify → judul via oEmbed → cari di YouTube
     try {
       const j = await fetchJson(`https://open.spotify.com/oembed?url=${encodeURIComponent(link)}`, {}, 10000);
-      if (j?.title) {
-        const list = await searchYouTube(`${j.title} audio`);
-        if (list[0]) return list[0];
-      }
+      if (j?.title) return (await searchYouTube(`${j.title} audio`))[0] || null;
     } catch {}
     return null;
   }
   if (link) return { url: link, title: '' };
-
-  // Angka → pilih dari hasil .yts terakhir
   if (/^[1-6]$/.test(text) && lastSearch.get(jid)?.[Number(text) - 1]) return lastSearch.get(jid)[Number(text) - 1];
-
-  if (text) {
-    const list = await searchYouTube(text);
-    return list[0] || null;
-  }
-  const last = lastPlaySession.get(jid);
-  return last ? { url: last.url, title: last.title } : null;
+  if (text) return (await searchYouTube(text))[0] || null;
+  return lastPlaySession.get(jid) || null;
 }
 
+const TT = 'https://vt.tiktok.com/...';
+const NEED_URL = {
+  tiktok: TT, tt: TT, ttmp3: TT, ttslide: TT, capcut: 'https://www.capcut.com/tv2/...',
+  igdl: 'https://www.instagram.com/reel/...', fb: 'https://fb.watch/...', twitter: 'https://x.com/user/status/...',
+  mediafire: 'https://www.mediafire.com/file/...', gdrive: 'https://drive.google.com/file/d/...',
+};
+const NEED_TEXT = { play: 'komang raim laode', play2: 'komang raim laode', song: 'komang raim laode', spotify: 'komang raim laode', yts: 'lofi chill', tts: 'halo semuanya' };
 const HELP = (cmd, ex) => `⚠️ Contoh: \`.${cmd} ${ex}\``;
 
 export async function handleDownloadCommand({ sock, jid, cmd, param = '', msg }) {
   if (!DOWNLOAD_COMMANDS.includes(cmd)) return false;
   param = String(param || '').trim();
-  const reply = (text) => sock.sendMessage(jid, { text }, { quoted: msg });
+  const reply = (text) => say(sock, jid, msg, text);
 
   if (cmd === 'downloadmenu' || cmd === 'dlmenu') { await reply(DOWNLOAD_MENU); return true; }
 
   // Validasi cepat sebelum masuk antrian
-  const needUrl = {
-    tiktok: 'https://vt.tiktok.com/...', tt: 'https://vt.tiktok.com/...', ttmp3: 'https://vt.tiktok.com/...',
-    ttslide: 'https://vt.tiktok.com/...', capcut: 'https://www.capcut.com/tv2/...',
-    igdl: 'https://www.instagram.com/reel/...', fb: 'https://fb.watch/...', twitter: 'https://x.com/user/status/...',
-    mediafire: 'https://www.mediafire.com/file/...', gdrive: 'https://drive.google.com/file/d/...',
-  };
-  if (needUrl[cmd] && !extractUrl(param)) { await reply(HELP(cmd, needUrl[cmd])); return true; }
-  if (['play', 'play2', 'song', 'spotify', 'yts', 'tts'].includes(cmd) && !param) {
-    await reply(HELP(cmd, cmd === 'tts' ? 'halo semuanya' : cmd === 'yts' ? 'lofi chill' : 'komang raim laode')); return true;
-  }
+  if (NEED_URL[cmd] && !extractUrl(param)) { await reply(HELP(cmd, NEED_URL[cmd])); return true; }
+  if (NEED_TEXT[cmd] && !param) { await reply(HELP(cmd, NEED_TEXT[cmd])); return true; }
   if (cmd === 'gitclone' && !/github\.com\/[^/\s]+\/[^/\s]+/i.test(param)) { await reply(HELP(cmd, 'https://github.com/user/repo')); return true; }
 
-  return withSlot(async () => {
-    await react(sock, jid, msg, '⏳');
-    let ok = false;
-    try {
-      ok = await dispatch({ sock, jid, cmd, param, msg, reply });
-    } catch (e) {
-      const m = String(e?.message || '');
-      await reply(m === 'FILE_TOO_BIG' ? '📦 File terlalu besar untuk WhatsApp (maks ±95MB).' : '❌ Terjadi kesalahan saat memproses. Coba lagi sebentar.');
-    }
-    await react(sock, jid, msg, ok ? '✅' : '❌');
-    return true;
-  });
+  return withReaction(sock, jid, msg, () => dispatch({ sock, jid, cmd, param, msg, reply }), (e) =>
+    reply(e?.message === 'FILE_TOO_BIG' ? '📦 File terlalu besar untuk WhatsApp (maks ±1.9GB).' : '❌ Terjadi kesalahan saat memproses. Coba lagi sebentar.'));
 }
 
 async function dispatch({ sock, jid, cmd, param, msg, reply }) {
-  /* TikTok */
+  const failMsg = async (text) => { await reply(text); return false; };
+
   if (['tiktok', 'tt', 'ttmp3', 'ttslide'].includes(cmd)) {
-    const mode = cmd === 'ttmp3' ? 'audio' : cmd === 'ttslide' ? 'slide' : 'auto';
-    return runTikTok(sock, jid, extractUrl(param), msg, mode);
+    return runTikTok(sock, jid, extractUrl(param), msg, { ttmp3: 'audio', ttslide: 'slide' }[cmd] || 'auto');
   }
+  if (['capcut', 'igdl', 'fb', 'twitter', 'mediafire', 'gdrive'].includes(cmd)) return runGeneric(sock, jid, cmd, extractUrl(param), msg);
 
-  if (cmd === 'capcut') return runGeneric(sock, jid, 'capcut', extractUrl(param), msg);
-
-  /* YouTube: ytmp3 / ytmp4 / ytdl / video */
   if (['ytmp4', 'ytmp3', 'ytdl', 'video'].includes(cmd)) {
     const hMatch = param.match(/\b(144|240|360|480|720|1080)p?\b\s*$/);
     const height = hMatch ? Number(hMatch[1]) : 720;
-    const clean = hMatch ? param.slice(0, hMatch.index).trim() : param;
-    const t = await resolveYouTubeTarget(jid, clean);
-    if (!t?.url) { await reply(HELP(cmd, 'https://youtu.be/... atau judul lagu')); return false; }
+    const t = await resolveYouTubeTarget(jid, hMatch ? param.slice(0, hMatch.index).trim() : param);
+    if (!t?.url) return failMsg(HELP(cmd, 'https://youtu.be/... atau judul lagu'));
     const isAud = cmd === 'ytmp3';
-    const yt = await downloadYouTube(t.url, isAud, { height, maxDuration: 3600 });
-    if (!yt?.buffer) { await reply('❌ Gagal mengunduh media YouTube (terlalu panjang/besar atau dibatasi). Coba resolusi lebih rendah, mis. `.ytmp4 <link> 360`.'); return false; }
+    const yt = await downloadYouTube(t.url, isAud, { height });
+    if (!yt?.buffer) return failMsg('❌ Gagal mengunduh media YouTube (terlalu besar atau dibatasi). Coba resolusi lebih rendah, mis. `.ytmp4 <link> 360`.');
     lastPlaySession.set(jid, { url: t.url, title: yt.title });
     const name = safeName(yt.title || t.title || 'media');
-    return sendItems(sock, jid, [isAud
-      ? { type: 'audio', buffer: yt.buffer, fileName: `${name}.mp3` }
-      : { type: 'video', buffer: yt.buffer, title: name }], msg, `🎬 *${yt.title || t.title}*\n_${height}p_`);
+    const item = isAud ? { type: 'audio', buffer: yt.buffer, fileName: `${name}.mp3` } : { type: 'video', buffer: yt.buffer, title: name };
+    return sendItems(sock, jid, [item], msg, `🎬 *${yt.title || t.title}*\n_${height}p_`);
   }
 
-  /* Play / Spotify */
   if (['play', 'play2', 'song', 'spotify'].includes(cmd)) {
     const t = await resolveYouTubeTarget(jid, param);
-    if (!t?.url) { await reply('❌ Lagu tidak ditemukan.'); return false; }
+    if (!t?.url) return failMsg('❌ Lagu tidak ditemukan.');
     const asVideo = cmd === 'play2';
     lastPlaySession.set(jid, { url: t.url, title: t.title || param });
-
-    const card = `🎵 *${t.title || param}*\n` +
-      (t.channel ? `👤 ${t.channel}\n` : '') +
-      (t.duration ? `⏱️ ${t.duration}` : '') +
-      (t.views ? `  •  👁️ ${t.views}` : '') +
-      `\n⏳ _Mengirim ${asVideo ? 'video' : 'audio'}..._`;
+    const card = `🎵 *${t.title || param}*\n${t.channel ? `👤 ${t.channel}\n` : ''}${t.duration ? `⏱️ ${t.duration}` : ''}${t.views ? `  •  👁️ ${t.views}` : ''}\n⏳ _Mengirim ${asVideo ? 'video' : 'audio'}..._`;
     // Kartu info dikirim paralel dengan proses unduh agar terasa cepat
-    const cardP = (t.thumb
-      ? sock.sendMessage(jid, { image: { url: t.thumb }, caption: card }, { quoted: msg }).catch(() => reply(card))
-      : reply(card)).catch(() => {});
-    const dlP = downloadYouTube(t.url, !asVideo, { height: 480, maxDuration: 1800 });
-    const [, yt] = await Promise.all([cardP, dlP]);
-
-    if (!yt?.buffer) { await reply(`❌ Gagal mengambil ${asVideo ? 'video' : 'audio'} untuk *${t.title || param}* (durasi maks 30 menit).`); return false; }
+    const cardP = (t.thumb ? sock.sendMessage(jid, { image: { url: t.thumb }, caption: card }, { quoted: msg }).catch(() => reply(card)) : reply(card)).catch(() => {});
+    const [, yt] = await Promise.all([cardP, downloadYouTube(t.url, !asVideo, { height: 480 })]);
+    if (!yt?.buffer) return failMsg(`❌ Gagal mengambil ${asVideo ? 'video' : 'audio'} untuk *${t.title || param}*.`);
     const name = safeName(yt.title || t.title || 'lagu');
-    return sendItems(sock, jid, [asVideo
-      ? { type: 'video', buffer: yt.buffer, title: name }
-      : { type: 'audio', buffer: yt.buffer, fileName: `${name}.mp3` }], msg, asVideo ? `🎬 *${name}*` : '');
+    const item = asVideo ? { type: 'video', buffer: yt.buffer, title: name } : { type: 'audio', buffer: yt.buffer, fileName: `${name}.mp3` };
+    return sendItems(sock, jid, [item], msg, asVideo ? `🎬 *${name}*` : '');
   }
 
-  /* Pencarian YouTube */
   if (cmd === 'yts') {
     const list = await searchYouTube(param);
-    if (!list.length) { await reply('❌ Tidak ditemukan.'); return false; }
+    if (!list.length) return failMsg('❌ Tidak ditemukan.');
     lastSearch.set(jid, list);
-    await reply(
-      list.map((v, i) => `*${i + 1}. ${v.title}*\n⏱️ ${v.duration}${v.channel ? ` • ${v.channel}` : ''}\n🔗 ${v.url}`).join('\n\n') +
-      '\n\n_Balas dengan_ `.ytmp3 <angka>` _atau_ `.ytmp4 <angka>`',
-    );
+    await reply(`${list.map((v, i) => `*${i + 1}. ${v.title}*\n⏱️ ${v.duration}${v.channel ? ` • ${v.channel}` : ''}\n🔗 ${v.url}`).join('\n\n')}\n\n_Balas dengan_ \`.ytmp3 <angka>\` _atau_ \`.ytmp4 <angka>\``);
     return true;
   }
 
-  /* Instagram / Facebook / Twitter / Mediafire / GDrive */
-  if (['igdl', 'fb', 'twitter', 'mediafire', 'gdrive'].includes(cmd)) {
-    return runGeneric(sock, jid, cmd, extractUrl(param), msg);
-  }
-
-  /* GitHub clone */
   if (cmd === 'gitclone') {
     const m = param.match(/github\.com\/([^/\s]+)\/([^/\s?#]+)(?:\/tree\/([^\s?#]+))?/i);
-    const owner = m[1];
-    const repo = m[2].replace(/\.git$/i, '');
+    const [owner, repo] = [m[1], m[2].replace(/\.git$/i, '')];
     let branch = m[3];
     let sizeKb = 0;
     try {
       const info = await fetchJson(`https://api.github.com/repos/${owner}/${repo}`, { headers: { 'User-Agent': 'WHUXEN-BOT', Accept: 'application/vnd.github+json' } }, 10000);
-      branch = branch || info.default_branch || 'HEAD';
+      branch ||= info.default_branch;
       sizeKb = info.size || 0;
     } catch (e) {
-      if (/404/.test(String(e?.message))) { await reply('❌ Repo tidak ditemukan atau privat.'); return false; }
-      branch = branch || 'HEAD';
+      if (/404/.test(String(e?.message))) return failMsg('❌ Repo tidak ditemukan atau privat.');
     }
+    branch ||= 'HEAD';
     const zipUrl = `https://codeload.github.com/${owner}/${repo}/zip/${branch === 'HEAD' ? 'HEAD' : `refs/heads/${branch}`}`;
-    if (sizeKb * 1024 > MAX_BYTES) { await reply(`📦 Repo terlalu besar untuk WhatsApp.\n🔗 ${zipUrl}`); return false; }
+    if (sizeKb * 1024 > MAX_BYTES) return failMsg(`📦 Repo terlalu besar untuk WhatsApp.\n🔗 ${zipUrl}`);
     return sendItems(sock, jid, [{ type: 'document', url: zipUrl, fileName: `${repo}-${branch}.zip`, mimetype: 'application/zip' }], msg, `📦 *${owner}/${repo}* (${branch})`);
   }
 
-  /* Text-to-Speech: .tts [kode-bahasa] teks */
-  if (cmd === 'tts') {
-    let lang = 'id';
-    let text = param;
+  if (cmd === 'tts') { // .tts [kode-bahasa] teks
+    const LANGS = ['id', 'en', 'ja', 'ko', 'ar', 'es', 'fr', 'de', 'hi', 'ru', 'pt', 'zh', 'zh-CN', 'th', 'tr', 'ms', 'jw', 'su'];
     const lm = param.match(/^([a-z]{2}(?:-[A-Z]{2})?)\s+([\s\S]+)/);
-    if (lm && ['id', 'en', 'ja', 'ko', 'ar', 'es', 'fr', 'de', 'hi', 'ru', 'pt', 'zh', 'zh-CN', 'th', 'tr', 'ms', 'jw', 'su'].includes(lm[1])) {
-      lang = lm[1]; text = lm[2];
-    }
-    // Pecah per ≤180 karakter (batas Google TTS) lalu gabungkan
-    const chunks = [];
+    const [lang, text] = lm && LANGS.includes(lm[1]) ? [lm[1], lm[2]] : ['id', param];
+    const chunks = []; // pecah ≤180 karakter (batas Google TTS)
     let cur = '';
     for (const w of text.replace(/\s+/g, ' ').trim().split(' ')) {
-      if ((cur + ' ' + w).trim().length > 180) { if (cur) chunks.push(cur); cur = w.slice(0, 180); } else cur = (cur + ' ' + w).trim();
+      if (`${cur} ${w}`.trim().length > 180) { if (cur) chunks.push(cur); cur = w.slice(0, 180); } else cur = `${cur} ${w}`.trim();
     }
     if (cur) chunks.push(cur);
     const parts = await Promise.all(chunks.slice(0, 8).map((c) =>
       fetchBuffer(`https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(c)}&tl=${lang}&client=tw-ob`).catch(() => null)));
     const good = parts.filter(Boolean);
-    if (!good.length) { await reply('❌ Gagal membuat suara. Coba lagi.'); return false; }
+    if (!good.length) return failMsg('❌ Gagal membuat suara. Coba lagi.');
     return sendItems(sock, jid, [{ type: 'audio', buffer: Buffer.concat(good), ptt: true }], msg);
   }
 
   return true;
 }
 
-/* ───────────────────────── Sticker, ViewOnce, AI & UI Helpers ───────────────────────── */
+/* ───────────────────────── Stiker, ViewOnce, AI & UI ───────────────────────── */
 
 export async function mediaBufferToWebpSticker(buffer, isVideo = false) {
   const id = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
   const inPath = path.join(os.tmpdir(), `in_${id}.${isVideo ? 'mp4' : 'png'}`);
   const outPath = path.join(os.tmpdir(), `out_${id}.webp`);
+  const fit = 'scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000';
   try {
     await fsPromises.writeFile(inPath, buffer);
-    const args = isVideo
-      ? ['-y', '-i', inPath, '-t', '6', '-vf', 'fps=12,scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000', '-loop', '0', '-an', '-vsync', '0', outPath]
-      : ['-y', '-i', inPath, '-vf', 'scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000', outPath];
-    await execFileAsync('ffmpeg', args);
+    await execFileAsync('ffmpeg', isVideo
+      ? ['-y', '-i', inPath, '-t', '6', '-vf', `fps=12,${fit}`, '-loop', '0', '-an', '-vsync', '0', outPath]
+      : ['-y', '-i', inPath, '-vf', fit, outPath]);
     return await fsPromises.readFile(outPath);
   } catch {
     return null;
   } finally {
-    await fsPromises.unlink(inPath).catch(() => {});
-    await fsPromises.unlink(outPath).catch(() => {});
+    await Promise.all([inPath, outPath].map((f) => fsPromises.unlink(f).catch(() => {})));
   }
 }
 
 export async function createBratSticker(text, isVideo = false) {
   try {
-    const endpoint = isVideo
-      ? `https://api.siputzx.my.id/api/m/brat?text=${encodeURIComponent(text)}&isVideo=true`
-      : `https://api.siputzx.my.id/api/m/brat?text=${encodeURIComponent(text)}`;
-    const buf = await fetchBuffer(endpoint);
-    return await mediaBufferToWebpSticker(buf, isVideo);
+    return await mediaBufferToWebpSticker(await fetchBuffer(`https://api.siputzx.my.id/api/m/brat?text=${encodeURIComponent(text)}${isVideo ? '&isVideo=true' : ''}`), isVideo);
   } catch {
     return null;
   }
@@ -785,10 +648,8 @@ export async function createBratSticker(text, isVideo = false) {
 
 export async function urlOrTextToWebpSticker(input) {
   try {
-    const url = extractUrl(input);
-    const imgUrl = url || `https://dummyimage.com/512x512/ffffff/000000.png&text=${encodeURIComponent(input.slice(0, 60))}`;
-    const buf = await fetchBuffer(imgUrl);
-    return await mediaBufferToWebpSticker(buf, false);
+    const imgUrl = extractUrl(input) || `https://dummyimage.com/512x512/ffffff/000000.png&text=${encodeURIComponent(input.slice(0, 60))}`;
+    return await mediaBufferToWebpSticker(await fetchBuffer(imgUrl), false);
   } catch {
     return null;
   }
@@ -816,19 +677,10 @@ export async function extractAndDownloadViewOnce(quotedMessage) {
 export async function sendNativeInteractiveButtons(sock, jid, payload, quoted) {
   const { title = '', body = '', footer = '', buttons = [], sections = [], listTitle = 'Menu' } = payload || {};
   try {
-    const nativeButtons = [];
-    if (sections.length) {
-      nativeButtons.push({
-        name: 'single_select',
-        buttonParamsJson: JSON.stringify({ title: listTitle, sections }),
-      });
-    }
-    for (const b of buttons) {
-      nativeButtons.push({
-        name: 'quick_reply',
-        buttonParamsJson: JSON.stringify({ display_text: b.text, id: b.id }),
-      });
-    }
+    const nativeButtons = [
+      ...(sections.length ? [{ name: 'single_select', buttonParamsJson: JSON.stringify({ title: listTitle, sections }) }] : []),
+      ...buttons.map((b) => ({ name: 'quick_reply', buttonParamsJson: JSON.stringify({ display_text: b.text, id: b.id }) })),
+    ];
     await sock.sendMessage(jid, {
       viewOnceMessage: {
         message: {
@@ -842,17 +694,20 @@ export async function sendNativeInteractiveButtons(sock, jid, payload, quoted) {
       },
     }, { quoted });
   } catch {
-    const btnLines = buttons.map((b) => `• \`.${b.id}\` — ${b.text}`).join('\n');
-    const secLines = sections.flatMap((s) => s.rows || []).map((r) => `• \`.${r.id}\` — ${r.title}`).join('\n');
-    const fallback = [title && `*${title}*`, body, secLines, btnLines, footer && `_${footer}_`].filter(Boolean).join('\n\n');
+    const lines = (rows) => rows.join('\n');
+    const fallback = [
+      title && `*${title}*`, body,
+      lines(sections.flatMap((s) => s.rows || []).map((r) => `• \`.${r.id}\` — ${r.title}`)),
+      lines(buttons.map((b) => `• \`.${b.id}\` — ${b.text}`)),
+      footer && `_${footer}_`,
+    ].filter(Boolean).join('\n\n');
     await sock.sendMessage(jid, { text: fallback }, { quoted });
   }
 }
 
 export async function panggilServerAISatSet(prompt, systemInstruction = 'Jawab singkat dan akurat dalam Bahasa Indonesia.') {
   try {
-    const full = `${systemInstruction}\n\nPertanyaan: ${prompt}`;
-    const res = await fetchWithTimeout(`https://text.pollinations.ai/${encodeURIComponent(full)}?model=openai`, {
+    const res = await fetchWithTimeout(`https://text.pollinations.ai/${encodeURIComponent(`${systemInstruction}\n\nPertanyaan: ${prompt}`)}?model=openai`, {
       headers: { 'User-Agent': 'WHUXEN-BOT/1.0' },
     }, 18000);
     if (!res.ok) return null;
@@ -865,8 +720,7 @@ export async function panggilServerAISatSet(prompt, systemInstruction = 'Jawab s
 
 export async function getAnimeImageUrl(category = 'waifu') {
   try {
-    const clean = category === 'kickanime' ? 'kick' : category;
-    const res = await fetchJson(`https://api.waifu.pics/sfw/${encodeURIComponent(clean)}`, {}, 10000);
+    const res = await fetchJson(`https://api.waifu.pics/sfw/${encodeURIComponent(category === 'kickanime' ? 'kick' : category)}`, {}, 10000);
     return res?.url || null;
   } catch {
     return null;
