@@ -8,7 +8,7 @@ import pino from 'pino';
 import { mulaiWeb } from './web.js';
 import { restoreAuthFromGitHub, scheduleAuthBackupToGitHub, startGitHubLiveHotReload, setupGracefulShutdown } from './github_sync.js';
 import { SPOTIFY_LIVE_BUTTON_IDS, handleSpotifyLiveButton } from './spotify_live.js';
-import { ALL_GROUP_COMMANDS, isSenderGroupAdmin, handleGroupMessageGuard, handleGroupCommand, handleGroupParticipantsUpdate, handleGroupJoinRequestEvent, startGroupAutomationScheduler, handleGroupThemeInteraction } from './group_automation.js';
+import { ALL_GROUP_COMMANDS, GROUP_AUTO_ONLY_COMMANDS, GROUP_SECURITY_MENU, isSenderGroupAdmin, handleGroupMessageGuard, handleGroupCommand, handleGroupParticipantsUpdate, handleGroupJoinRequestEvent, startGroupAutomationScheduler, handleGroupThemeInteraction } from './group_automation.js';
 import { PREMIUM_COMMANDS, ensureUserRecord, checkAndConsumeDailyLimit, handlePremiumCommand, startPremiumAndQrisWatcher } from './premium_limit.js';
 import { fetchWithTimeout, fetchBuffer, extractUrl, downloadTikTok, downloadCapCut, searchYouTube, downloadYouTube, downloadSocialMedia, mediaBufferToWebpSticker, createBratSticker, urlOrTextToWebpSticker, extractAndDownloadViewOnce, sendNativeInteractiveButtons, panggilServerAISatSet, getAnimeImageUrl } from './engines.js';
 
@@ -537,7 +537,8 @@ async function prosesSatuPesan(sock, msg) {
               rows: [
                 { title: '📊 Cek Sisa Limit Harian', description: 'Lihat sisa kuota harian atau masa aktif Premium', id: 'limit' },
                 { title: '💳 Beli Premium QRIS 1 Minggu', description: 'Aktivasi otomatis Unlimited selama 7 hari', id: 'qris' },
-                { title: '🛡️ Panel Keamanan & Otomatisasi Grup', description: 'Anti-Link, Welcome, Jadwal & ACC Member', id: 'panelgrup' },
+                { title: '🛡️ Menu Keamanan Grup', description: 'Anti-Link, Auto ACC, Kick, Mute & Filter Member', id: 'keamanangrup' },
+                { title: '⚙️ Panel Otomatisasi Grup', description: 'Jadwal kegiatan, Welcome & Auto Buka/Tutup', id: 'panelgrup' },
                 { title: '📋 Daftar Lengkap Semua Fitur', description: 'Tampilkan seluruh perintah bot', id: 'allmenu' },
               ],
             },
@@ -551,7 +552,7 @@ async function prosesSatuPesan(sock, msg) {
             },
           ],
           buttons: [
-            { text: '📊 Cek Limit', id: 'limit' },
+            { text: '🛡️ Keamanan Grup', id: 'keamanangrup' },
             { text: '💳 QRIS Premium', id: 'qris' },
             { text: '📋 Semua Fitur', id: 'allmenu' },
           ],
@@ -564,12 +565,12 @@ async function prosesSatuPesan(sock, msg) {
         for (const [cat, list] of Object.entries(MENU_CATEGORIES)) {
           if (cat !== 'GROUP') out += formatCategoryBox(cat, list) + '\n';
         }
-        out += formatCategoryBox('GROUP_SECURITY_AUTO', ALL_GROUP_COMMANDS) + '\n' + formatCategoryBox('LIMIT_PREMIUM', PREMIUM_COMMANDS) + '\n';
+        out += GROUP_SECURITY_MENU + '\n\n' + formatCategoryBox('GROUP_AUTOMATION', GROUP_AUTO_ONLY_COMMANDS) + '\n' + formatCategoryBox('LIMIT_PREMIUM', PREMIUM_COMMANDS) + '\n';
         await sock.sendMessage(jid, { text: out, contextInfo: { forwardingScore: 999, isForwarded: true } }, { quoted: msg });
         return;
       }
 
-      if (cmd === 'groupmenu') { await sock.sendMessage(jid, { text: formatCategoryBox('GROUP_SECURITY_AUTO', ALL_GROUP_COMMANDS) }, { quoted: msg }); return; }
+      if (cmd === 'groupmenu') { await sock.sendMessage(jid, { text: GROUP_SECURITY_MENU }, { quoted: msg }); return; }
       const subMenus = { aimenu: 'AI', downloadmenu: 'DOWNLOAD', searchmenu: 'SEARCH', animemenu: 'ANIME', funmenu: 'FUN', logomenu: 'STICKER_LOGO', toolsmenu: 'TOOLS', ownermenu: 'OWNER' };
       if (subMenus[cmd]) { await sock.sendMessage(jid, { text: formatCategoryBox(subMenus[cmd], MENU_CATEGORIES[subMenus[cmd]]) }, { quoted: msg }); return; }
 
