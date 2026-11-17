@@ -82,9 +82,8 @@ async function repairSignalSessionForJid(jid = '', reason = 'Signal Reset') {
 }
 
 async function jalankanAuditFiturRealTime(manual = false) {
-  const nowStr = new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' });
   const rep = {
-    lastChecked: nowStr,
+    lastChecked: new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' }),
     summary: `${ALL_COMMANDS_SET.size}/${ALL_COMMANDS_SET.size} Fitur VALID & Modular Aktif`,
     details: {
       'Group Security & Auto': `✅ ${ALL_GROUP_COMMANDS.length} Perintah Aktif`,
@@ -145,13 +144,12 @@ async function loadMemory() {
 }
 
 const saveMemory = () => fsPromises.writeFile(MEMORY_FILE, JSON.stringify(dbMemory, null, 2), 'utf-8').catch(() => {});
-
 const getTodayDateString = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta' }).format(new Date());
 
 function getIndonesianFullDateTime() {
-  const now = new Date();
-  const full = new Intl.DateTimeFormat('id-ID', { timeZone: 'Asia/Jakarta', weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' }).format(now) + ' WIB';
-  return { full };
+  return {
+    full: new Intl.DateTimeFormat('id-ID', { timeZone: 'Asia/Jakarta', weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' }).format(new Date()) + ' WIB',
+  };
 }
 
 function getUptime() {
@@ -200,11 +198,7 @@ async function kirimTampilanKuroSlash(sock, jid, senderNum, st, eventText, quote
   await sendNativeInteractiveButtons(sock, jid, {
     title: '⚔️ KURO SLASH — DEMON HUNTER',
     body: `👤 Pemain: @${senderNum}\n❤️ HP: ${st.hp}% | ⚡ ULTI: ${st.ulti}%\n🏆 Skor: *${st.score}* (Best: ${st.best})\n\nArena: [ ${lanes.join(' | ')} ]\n💬 _${eventText}_`,
-    buttons: [
-      { text: '⬅️ KIRI', id: 'kiri' },
-      { text: '⚔️ TEBAS', id: 'tebas' },
-      { text: '➡️ KANAN', id: 'kanan' },
-    ],
+    buttons: [{ text: '⬅️ KIRI', id: 'kiri' }, { text: '⚔️ TEBAS', id: 'tebas' }, { text: '➡️ KANAN', id: 'kanan' }],
   }, quoted);
 }
 
@@ -212,11 +206,7 @@ async function kirimTampilanSonic(sock, jid, senderNum, st, eventText, quoted) {
   await sendNativeInteractiveButtons(sock, jid, {
     title: '🌀 SPEEDY DASH — SONIC RUN',
     body: `👤 Pemain: @${senderNum}\n💍 Gold Rings: *${st.rings}* | 🏆 Skor: *${st.score}* (Best: ${st.best})\n${st.laserAlert ? '⚠️ *AWAS LASER DI DEPAN! TEKAN JUMP!*' : '🛣️ Lintasan aman untuk nge-boost!'}\n\n💬 _${eventText}_`,
-    buttons: [
-      { text: '⚡ BOOST', id: 'boost' },
-      { text: '⬆️ JUMP', id: 'jump' },
-      { text: '🛑 STOP', id: 'stopgame' },
-    ],
+    buttons: [{ text: '⚡ BOOST', id: 'boost' }, { text: '⬆️ JUMP', id: 'jump' }, { text: '🛑 STOP', id: 'stopgame' }],
   }, quoted);
 }
 
@@ -226,8 +216,7 @@ async function getJadwalSholatIndonesia(city) {
     const kota = search?.data?.[0];
     if (!kota) return null;
     const d = new Date();
-    const url = `https://api.myquran.com/v2/sholat/jadwal/${kota.id}/${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`;
-    const res = await (await fetchWithTimeout(url, {}, 10000)).json();
+    const res = await (await fetchWithTimeout(`https://api.myquran.com/v2/sholat/jadwal/${kota.id}/${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`, {}, 10000)).json();
     const j = res?.data?.jadwal;
     if (!j) return null;
     return `🕌 *JADWAL SHOLAT — ${kota.lokasi}*\n📅 ${j.tanggal}\n\n• Imsak: *${j.imsak}*\n• Subuh: *${j.subuh}*\n• Dzuhur: *${j.dzuhur}*\n• Ashar: *${j.ashar}*\n• Maghrib: *${j.maghrib}*\n• Isya: *${j.isya}*`;
@@ -236,8 +225,7 @@ async function getJadwalSholatIndonesia(city) {
 
 async function getSurahLengkap(no) {
   try {
-    const num = parseInt(no, 10) || 1;
-    const res = await (await fetchWithTimeout(`https://equran.id/api/v2/surat/${num}`, {}, 10000)).json();
+    const res = await (await fetchWithTimeout(`https://equran.id/api/v2/surat/${parseInt(no, 10) || 1}`, {}, 10000)).json();
     const d = res?.data;
     if (!d) return null;
     const ayat = (d.ayat || []).slice(0, 7).map((a) => `*${a.nomorAyat}.* ${a.teksArab}\n_${a.teksIndonesia}_`).join('\n\n');
@@ -251,8 +239,7 @@ async function getSurahLengkap(no) {
 function mulaiWeb() {
   const port = Number(process.env.PORT || 3000);
   http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
+    const payload = {
       bot: bot.userName,
       version: dbMemory.version,
       connected: bot.connected,
@@ -260,8 +247,92 @@ function mulaiWeb() {
       pairingCode: bot.pairingCode,
       uptime: getUptime(),
       features: ALL_COMMANDS_SET.size,
-    }));
-  }).listen(port, () => console.log(`🌐 Web Health Server aktif di port ${port}`));
+      stats: bot.stats,
+    };
+
+    if (req.url === '/status' || req.url === '/api/status') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(payload));
+      return;
+    }
+
+    const statusBadge = bot.connected
+      ? '<span class="badge online">● TERHUBUNG</span>'
+      : '<span class="badge offline">● MENUNGGU KONEKSI</span>';
+
+    const pairingSection = !bot.connected
+      ? `<div class="card pairing-card">
+          <div class="label">KODE PAIRING OTP WHATSAPP</div>
+          <div class="otp-code" id="otpText">${bot.pairingCode || 'Memuat kode OTP...'}</div>
+          ${bot.pairingCode ? `<button class="btn-copy" onclick="copyOtp()">📋 Salin Kode OTP</button>` : ''}
+          ${bot.qr ? `<div class="qr-wrap"><img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(bot.qr)}" alt="QR Code" /></div>` : ''}
+          <p class="hint">Buka WhatsApp → Perangkat Tertaut → Tautkan dengan Nomor Telepon</p>
+        </div>`
+      : '';
+
+    const html = `<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="refresh" content="5" />
+  <title>${bot.userName} Dashboard</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+    body { background: #0b0f19; color: #f1f5f9; min-height: 100vh; display: flex; justify-content: center; padding: 20px 14px; }
+    .container { width: 100%; max-width: 460px; }
+    .header { background: linear-gradient(135deg, #1e1b4b, #311042); border: 1px solid #3b2d6b; border-radius: 18px; padding: 20px; text-align: center; margin-bottom: 14px; box-shadow: 0 10px 25px rgba(0,0,0,0.35); }
+    .header h1 { font-size: 22px; letter-spacing: 0.5px; color: #fff; margin-bottom: 6px; }
+    .version { font-size: 12px; color: #c4b5fd; margin-bottom: 10px; }
+    .badge { display: inline-block; padding: 5px 12px; border-radius: 999px; font-size: 12px; font-weight: 700; }
+    .online { background: rgba(16, 185, 129, 0.18); color: #34d399; border: 1px solid rgba(52, 211, 153, 0.4); }
+    .offline { background: rgba(245, 158, 11, 0.18); color: #fbbf24; border: 1px solid rgba(251, 191, 36, 0.4); }
+    .card { background: #131a2a; border: 1px solid #1e293b; border-radius: 16px; padding: 16px; margin-bottom: 14px; }
+    .pairing-card { text-align: center; border-color: #6d28d9; background: #17152e; }
+    .label { font-size: 11px; font-weight: 700; letter-spacing: 1px; color: #94a3b8; margin-bottom: 8px; }
+    .otp-code { font-size: 30px; font-weight: 800; letter-spacing: 4px; color: #38bdf8; background: #0b0f19; padding: 12px; border-radius: 12px; border: 1px dashed #38bdf8; margin-bottom: 10px; }
+    .btn-copy { background: #7c3aed; color: #fff; border: none; padding: 9px 16px; border-radius: 10px; font-size: 13px; font-weight: 600; cursor: pointer; }
+    .qr-wrap { margin-top: 12px; }
+    .qr-wrap img { border-radius: 12px; background: #fff; padding: 8px; }
+    .hint { font-size: 12px; color: #94a3b8; margin-top: 10px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .stat-box { background: #0f1523; border: 1px solid #1e293b; border-radius: 12px; padding: 12px; }
+    .stat-title { font-size: 11px; color: #94a3b8; margin-bottom: 4px; }
+    .stat-val { font-size: 15px; font-weight: 700; color: #f8fafc; word-break: break-all; }
+    .footer { text-align: center; font-size: 11px; color: #64748b; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>🤖 ${bot.userName}</h1>
+      <div class="version">Versi ${dbMemory.version} • ${ALL_COMMANDS_SET.size} Fitur Aktif</div>
+      ${statusBadge}
+    </div>
+    ${pairingSection}
+    <div class="card">
+      <div class="label">INFORMASI SISTEM</div>
+      <div class="grid">
+        <div class="stat-box"><div class="stat-title">Nomor Bot</div><div class="stat-val">+${payload.phone}</div></div>
+        <div class="stat-box"><div class="stat-title">Runtime Aktif</div><div class="stat-val">${payload.uptime}</div></div>
+        <div class="stat-box"><div class="stat-title">Virtek Diblokir</div><div class="stat-val">${bot.stats.totalBlockedVirtek}</div></div>
+        <div class="stat-box"><div class="stat-title">Link & Toxic Dihapus</div><div class="stat-val">${bot.stats.totalDeletedLinks + bot.stats.totalDeletedBadWords}</div></div>
+      </div>
+    </div>
+    <div class="footer">Auto-refresh otomatis setiap 5 detik</div>
+  </div>
+  <script>
+    function copyOtp() {
+      const txt = document.getElementById('otpText')?.innerText || '';
+      if (navigator.clipboard) navigator.clipboard.writeText(txt);
+    }
+  </script>
+</body>
+</html>`;
+
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(html);
+  }).listen(port, () => console.log(`🌐 Web Dashboard aktif di port ${port}`));
 }
 
 const gameSessions = new Map();
@@ -532,7 +603,7 @@ async function prosesSatuPesan(sock, msg) {
         return;
       }
 
-      // MENU UTAMA (TIDAK DIUBAH)
+      // MENU UTAMA
       if (cmd === 'menu' || cmd === 'help') {
         const dt = getIndonesianFullDateTime();
         const userRec = ensureUserRecord(dbMemory, senderNum);
