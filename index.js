@@ -1,11 +1,11 @@
 import fs from 'fs';
 import fsPromises from 'fs/promises';
-import http from 'http';
 import os from 'os';
 import path from 'path';
 import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadContentFromMessage } from '@whiskeysockets/baileys';
 import pino from 'pino';
 
+import { mulaiWeb } from './web.js';
 import { restoreAuthFromGitHub, scheduleAuthBackupToGitHub, startGitHubLiveHotReload, setupGracefulShutdown } from './github_sync.js';
 import { SPOTIFY_LIVE_BUTTON_IDS, handleSpotifyLiveButton } from './spotify_live.js';
 import { ALL_GROUP_COMMANDS, isSenderGroupAdmin, handleGroupMessageGuard, handleGroupCommand, handleGroupParticipantsUpdate, handleGroupJoinRequestEvent, startGroupAutomationScheduler, handleGroupThemeInteraction } from './group_automation.js';
@@ -236,105 +236,6 @@ async function getSurahLengkap(no) {
   } catch { return null; }
 }
 
-function mulaiWeb() {
-  const port = Number(process.env.PORT || 3000);
-  http.createServer((req, res) => {
-    const payload = {
-      bot: bot.userName,
-      version: dbMemory.version,
-      connected: bot.connected,
-      phone: bot.userPhone || PHONE || '-',
-      pairingCode: bot.pairingCode,
-      uptime: getUptime(),
-      features: ALL_COMMANDS_SET.size,
-      stats: bot.stats,
-    };
-
-    if (req.url === '/status' || req.url === '/api/status') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(payload));
-      return;
-    }
-
-    const statusBadge = bot.connected
-      ? '<span class="badge online">● TERHUBUNG</span>'
-      : '<span class="badge offline">● MENUNGGU KONEKSI</span>';
-
-    const pairingSection = !bot.connected
-      ? `<div class="card pairing-card">
-          <div class="label">KODE PAIRING OTP WHATSAPP</div>
-          <div class="otp-code" id="otpText">${bot.pairingCode || 'Memuat kode OTP...'}</div>
-          ${bot.pairingCode ? `<button class="btn-copy" onclick="copyOtp()">📋 Salin Kode OTP</button>` : ''}
-          ${bot.qr ? `<div class="qr-wrap"><img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(bot.qr)}" alt="QR Code" /></div>` : ''}
-          <p class="hint">Buka WhatsApp → Perangkat Tertaut → Tautkan dengan Nomor Telepon</p>
-        </div>`
-      : '';
-
-    const html = `<!DOCTYPE html>
-<html lang="id">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta http-equiv="refresh" content="5" />
-  <title>${bot.userName} Dashboard</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
-    body { background: #0b0f19; color: #f1f5f9; min-height: 100vh; display: flex; justify-content: center; padding: 20px 14px; }
-    .container { width: 100%; max-width: 460px; }
-    .header { background: linear-gradient(135deg, #1e1b4b, #311042); border: 1px solid #3b2d6b; border-radius: 18px; padding: 20px; text-align: center; margin-bottom: 14px; box-shadow: 0 10px 25px rgba(0,0,0,0.35); }
-    .header h1 { font-size: 22px; letter-spacing: 0.5px; color: #fff; margin-bottom: 6px; }
-    .version { font-size: 12px; color: #c4b5fd; margin-bottom: 10px; }
-    .badge { display: inline-block; padding: 5px 12px; border-radius: 999px; font-size: 12px; font-weight: 700; }
-    .online { background: rgba(16, 185, 129, 0.18); color: #34d399; border: 1px solid rgba(52, 211, 153, 0.4); }
-    .offline { background: rgba(245, 158, 11, 0.18); color: #fbbf24; border: 1px solid rgba(251, 191, 36, 0.4); }
-    .card { background: #131a2a; border: 1px solid #1e293b; border-radius: 16px; padding: 16px; margin-bottom: 14px; }
-    .pairing-card { text-align: center; border-color: #6d28d9; background: #17152e; }
-    .label { font-size: 11px; font-weight: 700; letter-spacing: 1px; color: #94a3b8; margin-bottom: 8px; }
-    .otp-code { font-size: 30px; font-weight: 800; letter-spacing: 4px; color: #38bdf8; background: #0b0f19; padding: 12px; border-radius: 12px; border: 1px dashed #38bdf8; margin-bottom: 10px; }
-    .btn-copy { background: #7c3aed; color: #fff; border: none; padding: 9px 16px; border-radius: 10px; font-size: 13px; font-weight: 600; cursor: pointer; }
-    .qr-wrap { margin-top: 12px; }
-    .qr-wrap img { border-radius: 12px; background: #fff; padding: 8px; }
-    .hint { font-size: 12px; color: #94a3b8; margin-top: 10px; }
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-    .stat-box { background: #0f1523; border: 1px solid #1e293b; border-radius: 12px; padding: 12px; }
-    .stat-title { font-size: 11px; color: #94a3b8; margin-bottom: 4px; }
-    .stat-val { font-size: 15px; font-weight: 700; color: #f8fafc; word-break: break-all; }
-    .footer { text-align: center; font-size: 11px; color: #64748b; margin-top: 8px; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <div class="header">
-      <h1>🤖 ${bot.userName}</h1>
-      <div class="version">Versi ${dbMemory.version} • ${ALL_COMMANDS_SET.size} Fitur Aktif</div>
-      ${statusBadge}
-    </div>
-    ${pairingSection}
-    <div class="card">
-      <div class="label">INFORMASI SISTEM</div>
-      <div class="grid">
-        <div class="stat-box"><div class="stat-title">Nomor Bot</div><div class="stat-val">+${payload.phone}</div></div>
-        <div class="stat-box"><div class="stat-title">Runtime Aktif</div><div class="stat-val">${payload.uptime}</div></div>
-        <div class="stat-box"><div class="stat-title">Virtek Diblokir</div><div class="stat-val">${bot.stats.totalBlockedVirtek}</div></div>
-        <div class="stat-box"><div class="stat-title">Link & Toxic Dihapus</div><div class="stat-val">${bot.stats.totalDeletedLinks + bot.stats.totalDeletedBadWords}</div></div>
-      </div>
-    </div>
-    <div class="footer">Auto-refresh otomatis setiap 5 detik</div>
-  </div>
-  <script>
-    function copyOtp() {
-      const txt = document.getElementById('otpText')?.innerText || '';
-      if (navigator.clipboard) navigator.clipboard.writeText(txt);
-    }
-  </script>
-</body>
-</html>`;
-
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(html);
-  }).listen(port, () => console.log(`🌐 Web Dashboard aktif di port ${port}`));
-}
-
 const gameSessions = new Map();
 const lastPlaySession = new Map();
 const sentMessageCache = new Map();
@@ -410,7 +311,7 @@ function safeEvaluateMath(expr) {
 
 async function mintaKodePairing(sock, phone) {
   try {
-    if (!phone || sock.authState.creds.registered) return;
+    if (!sock || !phone || bot.connected || sock.authState?.creds?.registered) return;
     const code = await sock.requestPairingCode(phone);
     bot.pairingCode = code?.match(/.{1,4}/g)?.join('-') || code;
     console.log(`🔑 KODE OTP BOT: ${bot.pairingCode}`);
@@ -1005,5 +906,14 @@ async function start() {
   });
 }
 
-mulaiWeb();
+mulaiWeb({
+  bot,
+  dbMemory,
+  getUptime,
+  getFeatureCount: () => ALL_COMMANDS_SET.size,
+  requestNewPairingCode: () => {
+    bot.pairingCode = null;
+    return mintaKodePairing(bot.sock, PHONE);
+  },
+});
 start();
