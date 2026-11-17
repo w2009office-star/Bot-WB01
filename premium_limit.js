@@ -2,9 +2,8 @@ import http from 'http';
 import crypto from 'crypto';
 import fsPromises from 'fs/promises';
 import path from 'path';
-import { fetchWithTimeout } from './engines.js'; // sesuaikan: file yang meng-export fetchWithTimeout
 
-export const PREMIUM_COMMANDS = ['limit', 'ceklimit', 'premium', 'belipremium', 'qris', 'cekstatus', 'konfirmasi', 'accprem', 'addprem', 'delprem'];
+export const PREMIUM_COMMANDS = ['limit', 'ceklimit', 'premium', 'belipremium', 'qris', 'cekstatus', 'konfirmasi', 'accprem', 'addprem', 'delprem', 'listprem'];
 
 const DAILY_FREE_LIMIT = 15;
 const DANA_NUMBER = process.env.DANA_NUMBER || '085811980122';
@@ -13,24 +12,30 @@ const PAKASIR_SLUG = process.env.PAKASIR_SLUG || '';
 const PAKASIR_API_KEY = process.env.PAKASIR_API_KEY || '';
 const WEBHOOK_PORT = Number(process.env.QRIS_WEBHOOK_PORT || 3099);
 const WEBHOOK_SECRET = process.env.QRIS_WEBHOOK_SECRET || '';
-const INVOICE_TTL = 30 * 60 * 1000;
+const INVOICE_TTL = 5 * 60 * 1000; // tagihan berlaku 5 menit
 const MAX_TRIES = 3;
-const MIN_REF_LEN = 12;
+const PLAIN_MIN_LEN = 5; // hanya untuk ID yang dikirim tanpa perintah (anti salah deteksi chat biasa)
 const PAID_RX = /^(completed|paid|success|settlement)$/i;
 const rp = (n) => `Rp ${Number(n).toLocaleString('id-ID')}`;
 
-// Salin 3 gambar QR ke ./assets/ dengan nama: qris_1.png (Rp1.000), qris_2.png (Rp5.000), qris_3.png (Rp10.000)
-const QR_DIR = path.join(process.cwd(), 'assets');
+// Taruh 3 gambar QR di ./assets/ (atau folder env QRIS_DIR): qris_1 (Rp1.000), qris_2 (Rp5.000), qris_3 (Rp10.000) — .png/.jpg/.jpeg/.webp
+const QR_DIR = process.env.QRIS_DIR ? path.resolve(process.env.QRIS_DIR) : path.join(process.cwd(), 'assets');
 
 export const PREMIUM_PACKAGES = {
-  1: { days: 2, price: 1000, label: '2 Hari', img: 'qris_1.png' },
-  2: { days: 14, price: 5000, label: '2 Minggu', img: 'qris_2.png' },
-  3: { days: 30, price: 10000, label: '1 Bulan', img: 'qris_3.png' },
+  1: { days: 2, price: 1000, label: '2 Hari', img: 'qris_1' },
+  2: { days: 14, price: 5000, label: '2 Minggu', img: 'qris_2' },
+  3: { days: 30, price: 10000, label: '1 Bulan', img: 'qris_3' },
 };
 
 export const LIMIT_EXEMPT_COMMANDS = new Set([
   'menu', 'help', 'limit', 'ceklimit', 'premium', 'belipremium', 'qris', 'cekstatus', 'konfirmasi', 'owner',
 ]);
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), timeoutMs);
+  try { return await fetch(url, { ...options, signal: ac.signal }); } finally { clearTimeout(t); }
+}
 
 function getWibDateKey() {
   return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta' }).format(new Date());
@@ -52,6 +57,8 @@ export function formatRemainingTime(ms) {
   const s = Math.max(0, Math.floor(ms / 1000));
   return `${Math.floor(s / 86400)} hari ${Math.floor((s % 86400) / 3600)} jam ${Math.floor((s % 3600) / 60)} menit`;
 }
+
+const fmtWib = (ts) => new Date(ts).toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' });
 
 /* ───────────── Limit harian ───────────── */
 
@@ -77,39 +84,62 @@ export async function checkAndConsumeDailyLimit({ sock, jid, senderNum, isOwner,
   return { allowed: true, remaining: DAILY_FREE_LIMIT - user.dailyUsed };
 }
 
-/* ───────────── Aktivasi premium ───────────── */
+/* ───────────── Aktivasi premium (tersimpan di database) ───────────── */
 
 let currentSockRef = null;
 
-export async function activatePremiumForNumber(sock, dbMemory, saveMemory, targetNum, days = 2, source = 'QRIS') {
+export async function activatePremiumForNumber(sock, dbMemory, saveMemory, targetNum, days = 2, source = 'QRIS', opts = {}) {
   const cleanNum = String(targetNum).replace(/\D/g, '');
   if (!cleanNum) return null;
+  const s = sock || currentSockRef;
 
   const user = ensureUserRecord(dbMemory, cleanNum);
-  const base = user.premiumUntil > Date.now() ? user.premiumUntil : Date.now();
+  const now = Date.now();
+  const base = user.premiumUntil > now ? user.premiumUntil : now;
   user.premiumUntil = base + days * 86400000;
+  user.premiumSince = user.premiumSince && base > now ? user.premiumSince : now;
+  user.premiumTotalDays = (user.premiumTotalDays || 0) + days;
   user.dailyUsed = 0;
+
+  dbMemory.premiumLog ||= [];
+  dbMemory.premiumLog.push({ phone: cleanNum, days, source, ref: opts.ref || '', at: now, until: user.premiumUntil });
+  if (dbMemory.premiumLog.length > 1000) dbMemory.premiumLog = dbMemory.premiumLog.slice(-1000);
   if (Array.isArray(dbMemory.pendingInvoices)) dbMemory.pendingInvoices = dbMemory.pendingInvoices.filter((i) => i.phone !== cleanNum);
   await saveMemory();
 
-  const expText = new Date(user.premiumUntil).toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' });
-  await (sock || currentSockRef)?.sendMessage(`${cleanNum}@s.whatsapp.net`, {
-    text:
-      `🎉 *PEMBAYARAN DITERIMA (${source})!*\n\n` +
-      `Akun *+${cleanNum}* kini *PREMIUM UNLIMITED*.\n` +
-      `• Durasi: *${days} Hari*\n• Berlaku hingga: *${expText} WIB*\n• Limit harian: *∞*\n\n` +
-      `_Setelah masa aktif habis, akun kembali ke mode reguler._`,
-  }).catch(() => {});
+  const text =
+    `🎉 *SELAMAT! ANDA TELAH MENJADI MEMBER VIP*\n\n` +
+    `• Nomor: *+${cleanNum}*\n` +
+    `• Durasi VIP: *${days} Hari*\n` +
+    `• Berlaku hingga: *${fmtWib(user.premiumUntil)} WIB*\n` +
+    `• Limit harian: *∞ Tanpa Batas*\n` +
+    `• Verifikasi: ${source}\n\n` +
+    `_Setelah masa aktif habis, akun kembali ke mode reguler._`;
+
+  const targets = [...new Set([opts.notifyJid, `${cleanNum}@s.whatsapp.net`].filter(Boolean))];
+  for (const t of targets) {
+    try {
+      await s.sendMessage(t, { text }, t === opts.notifyJid && opts.quoted ? { quoted: opts.quoted } : undefined);
+      break;
+    } catch (e) {
+      console.error('[premium] gagal kirim ucapan ke', t, e?.message);
+    }
+  }
   return user.premiumUntil;
 }
 
 /** Atomik: invoice dihapus SEBELUM await → mustahil aktif dua kali. */
-async function settleInvoice(dbMemory, saveMemory, orderId, source) {
+async function settleInvoice(dbMemory, saveMemory, orderId, source, opts = {}) {
   const list = dbMemory.pendingInvoices || [];
   const inv = list.find((i) => i.orderId === orderId);
   if (!inv) return null;
   dbMemory.pendingInvoices = list.filter((i) => i.orderId !== orderId);
-  await activatePremiumForNumber(currentSockRef, dbMemory, saveMemory, inv.phone, inv.days, source);
+  try {
+    await activatePremiumForNumber(currentSockRef, dbMemory, saveMemory, inv.phone, inv.days, source, { notifyJid: inv.notifyJid, ...opts });
+  } catch (e) {
+    dbMemory.pendingInvoices.push(inv);
+    throw e;
+  }
   return inv;
 }
 
@@ -122,15 +152,24 @@ async function verifyPakasir(inv) {
   return PAID_RX.test(String(t.status || '')) && (!t.order_id || t.order_id === inv.orderId);
 }
 
-/* ───────────── Pembuatan invoice ───────────── */
+/* ───────────── Invoice + QR ───────────── */
 
 const qrUrl = (data) => `https://api.qrserver.com/v1/create-qr-code/?size=450x450&data=${encodeURIComponent(data)}`;
+
+async function loadQrFile(pkg) {
+  for (const ext of ['png', 'jpg', 'jpeg', 'webp']) {
+    const buffer = await fsPromises.readFile(path.join(QR_DIR, `${pkg.img}.${ext}`)).catch(() => null);
+    if (buffer?.length) return buffer;
+  }
+  console.warn(`[premium] file QR tidak ditemukan: ${path.join(QR_DIR, pkg.img)}.png`);
+  return null;
+}
 
 async function createQrisInvoice(dbMemory, saveMemory, senderNum, notifyJid, pkg) {
   dbMemory.pendingInvoices = (dbMemory.pendingInvoices || []).filter((i) => i.phone !== senderNum);
 
   const orderId = `PREM-${senderNum.slice(-4)}-${Date.now().toString().slice(-6)}`;
-  let qrImage = null; // { url } | { buffer }
+  let qrImage = null;
   let gatewayMode = 'MANUAL';
 
   if (PAKASIR_SLUG && PAKASIR_API_KEY) {
@@ -147,7 +186,7 @@ async function createQrisInvoice(dbMemory, saveMemory, senderNum, notifyJid, pkg
   }
 
   if (!qrImage) {
-    const buffer = await fsPromises.readFile(path.join(QR_DIR, pkg.img)).catch(() => null);
+    const buffer = await loadQrFile(pkg);
     if (buffer) qrImage = { buffer };
   }
 
@@ -167,6 +206,9 @@ async function createQrisInvoice(dbMemory, saveMemory, senderNum, notifyJid, pkg
   await saveMemory();
   return { invoice, qrImage };
 }
+
+const activeInvoice = (dbMemory, phone) =>
+  (dbMemory.pendingInvoices || []).find((i) => i.phone === phone && i.manual && i.expiresAt > Date.now());
 
 /* ───────────── Watcher, auto-expire, webhook ───────────── */
 
@@ -190,7 +232,7 @@ export function startPremiumAndQrisWatcher(sock, dbMemory, saveMemory) {
       for (const inv of [...dbMemory.pendingInvoices]) {
         if (inv.gatewayMode === 'PAKASIR' && (await verifyPakasir(inv))) await settleInvoice(dbMemory, saveMemory, inv.orderId, 'QRIS Otomatis');
       }
-    } catch {} finally { busy = false; }
+    } catch (e) { console.error('[premium] watcher:', e?.message); } finally { busy = false; }
   }, 12000);
 
   setInterval(async () => {
@@ -206,13 +248,13 @@ export function startPremiumAndQrisWatcher(sock, dbMemory, saveMemory) {
           changed = true;
           await currentSockRef?.sendMessage(`${phone}@s.whatsapp.net`, {
             text:
-              `⏳ *MASA AKTIF PREMIUM BERAKHIR*\n\nAkun *+${phone}* kembali ke *Mode Reguler* (${DAILY_FREE_LIMIT}x/hari).\n` +
+              `⏳ *MASA AKTIF VIP BERAKHIR*\n\nAkun *+${phone}* kembali ke *Mode Reguler* (${DAILY_FREE_LIMIT}x/hari).\n` +
               `Ketik *\`.qris\`* untuk memperpanjang.`,
           }).catch(() => {});
         }
       }
       if (changed) await saveMemory();
-    } catch {}
+    } catch (e) { console.error('[premium] expire:', e?.message); }
   }, 60000);
 
   if (!WEBHOOK_SECRET) {
@@ -246,11 +288,81 @@ export function startPremiumAndQrisWatcher(sock, dbMemory, saveMemory) {
   }).listen(WEBHOOK_PORT, () => console.log(`💳 Webhook aktif :${WEBHOOK_PORT}/webhook/qris`));
 }
 
-/* ───────────── Handler perintah ───────────── */
+/* ───────────── Verifikasi bukti (ID transaksi) ───────────── */
 
 const HOW_TO_ID =
   `📍 *Cara cek ID Transaksi:*\n` +
   `DANA → *Aktivitas/Riwayat* → pilih transaksi → *Rincian/Detail Transaksi* → salin *ID Transaksi*`;
+
+const normRef = (s) => String(s || '').replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+
+/** ID dianggap lama jika sama persis, atau potongan (≥4 karakter) dari ID yang pernah dipakai. */
+const isOldRef = (used, ref) => Object.keys(used).some((r) =>
+  r === ref || (Math.min(r.length, ref.length) >= 4 && (r.endsWith(ref) || ref.endsWith(r))));
+
+async function processProof({ sock, jid, senderNum, rawRef, msg, dbMemory, saveMemory }) {
+  const send = (text) => sock.sendMessage(jid, { text }, { quoted: msg });
+  const ref = normRef(rawRef);
+  const inv = activeInvoice(dbMemory, senderNum);
+
+  if (!inv) {
+    await send('📭 Tidak ada tagihan aktif (berlaku 5 menit sejak dibuat). Ketik `.qris` untuk membuat tagihan baru.');
+    return true;
+  }
+  if (!ref || !/\d/.test(ref)) {
+    await send(`⚠️ ID tidak terbaca. Kirim ID Transaksi DANA persis seperti di aplikasi.\n\n${HOW_TO_ID}`);
+    return true;
+  }
+  if (inv.tries >= MAX_TRIES) {
+    await send('⛔ Percobaan habis. Buat tagihan baru dengan `.qris`.');
+    return true;
+  }
+
+  dbMemory.usedRefs ||= {};
+  if (isOldRef(dbMemory.usedRefs, ref)) {
+    inv.tries += 1;
+    await saveMemory();
+    await send(`⛔ ID ini sudah pernah dipakai (bukan bukti terbaru). Sisa percobaan: ${MAX_TRIES - inv.tries}\n\n${HOW_TO_ID}`);
+    return true;
+  }
+
+  dbMemory.usedRefs[ref] = { orderId: inv.orderId, phone: senderNum, at: Date.now() };
+  let done = null;
+  try {
+    done = await settleInvoice(dbMemory, saveMemory, inv.orderId, 'ID Transaksi DANA', { quoted: msg, ref });
+  } catch (e) {
+    console.error('[premium] gagal aktivasi:', e?.message);
+  }
+  if (!done) {
+    delete dbMemory.usedRefs[ref];
+    await send('❌ Gagal memproses, silakan kirim ulang ID Anda.');
+    return true;
+  }
+  await saveMemory();
+
+  if (OWNER_NUMBER) {
+    await sock.sendMessage(`${OWNER_NUMBER}@s.whatsapp.net`, {
+      text:
+        `🔔 *VIP AKTIF OTOMATIS*\n+${senderNum}\nNominal: ${rp(done.amount)}\nPaket: ${done.days} hari\nID DANA: ${ref}\n\n` +
+        `Cocokkan dengan mutasi DANA. Jika palsu:\n\`.delprem ${senderNum}\``,
+    }).catch(() => {});
+  }
+  return true;
+}
+
+/**
+ * Panggil dari handler pesan untuk pesan BUKAN perintah (mis. member hanya menempel ID tanpa ".konfirmasi").
+ * Contoh: if (!isCommand && await handlePremiumProofText({ sock, jid, senderNum, text, msg, dbMemory, saveMemory })) return;
+ */
+export async function handlePremiumProofText({ sock, jid, senderNum, text = '', msg, dbMemory, saveMemory }) {
+  const t = String(text || '').trim();
+  if (!t || /^[.!/#]/.test(t) || /\s/.test(t)) return false;
+  if (!/^[A-Za-z0-9-]+$/.test(t) || !/\d/.test(t) || normRef(t).length < PLAIN_MIN_LEN) return false;
+  if (!activeInvoice(dbMemory, senderNum)) return false;
+  return processProof({ sock, jid, senderNum, rawRef: t, msg, dbMemory, saveMemory });
+}
+
+/* ───────────── Handler perintah ───────────── */
 
 export async function handlePremiumCommand({ sock, jid, senderNum, isOwner, isSenderAdmin, cmd, param = '', msg, dbMemory, saveMemory }) {
   if (!PREMIUM_COMMANDS.includes(cmd)) return false;
@@ -261,12 +373,12 @@ export async function handlePremiumCommand({ sock, jid, senderNum, isOwner, isSe
   if (cmd === 'limit' || cmd === 'ceklimit') {
     if (isOwner || isSenderAdmin) { await send('👑 *STATUS AKUN:* Admin / Owner\n• Limit Harian: *∞ Unlimited*'); return true; }
     if (isUserPremium(user)) {
-      await send(`💎 *STATUS: PREMIUM AKTIF*\n• Limit Harian: *∞ Unlimited*\n• Sisa Masa Aktif: *${formatRemainingTime(user.premiumUntil - Date.now())}*`);
+      await send(`💎 *STATUS: VIP AKTIF*\n• Limit Harian: *∞ Unlimited*\n• Berlaku hingga: *${fmtWib(user.premiumUntil)} WIB*\n• Sisa: *${formatRemainingTime(user.premiumUntil - Date.now())}*`);
       return true;
     }
     await send(
       `📊 *INFO LIMIT HARIAN*\n• Terpakai: *${user.dailyUsed}/${DAILY_FREE_LIMIT}*\n` +
-      `• Sisa: *${Math.max(0, DAILY_FREE_LIMIT - user.dailyUsed)}x*\n• Status: *Reguler*\n\nKetik *\`.qris\`* untuk Premium.`
+      `• Sisa: *${Math.max(0, DAILY_FREE_LIMIT - user.dailyUsed)}x*\n• Status: *Reguler*\n\nKetik *\`.qris\`* untuk VIP.`
     );
     return true;
   }
@@ -275,7 +387,7 @@ export async function handlePremiumCommand({ sock, jid, senderNum, isOwner, isSe
     const pkg = PREMIUM_PACKAGES[Number(param)];
     if (!pkg) {
       await send(
-        `💳 *PILIH PAKET PREMIUM*\n\n` +
+        `💳 *PILIH PAKET VIP*\n\n` +
         Object.entries(PREMIUM_PACKAGES).map(([k, p]) => `${k}️⃣ \`.qris ${k}\` — ${rp(p.price)} *(${p.label})*`).join('\n') +
         `\n\n_Contoh:_ \`.qris 3\``
       );
@@ -283,60 +395,35 @@ export async function handlePremiumCommand({ sock, jid, senderNum, isOwner, isSe
     }
     const { invoice, qrImage } = await createQrisInvoice(dbMemory, saveMemory, senderNum, jid, pkg);
     const caption =
-      `💳 *PEMBAYARAN PREMIUM (${pkg.label})*\n\n` +
+      `💳 *PEMBAYARAN VIP (${pkg.label})*\n\n` +
       `• ID Invoice: \`${invoice.orderId}\`\n` +
       `• Total Bayar: *${rp(invoice.amount)}*\n` +
       (invoice.manual
-        ? `• Scan QR *(khusus DANA)* atau transfer ke DANA *${DANA_NUMBER}*\n\n` +
-          `Setelah bayar, kirim:\n\`.konfirmasi <ID Transaksi DANA>\`\n\n${HOW_TO_ID}\n\n` +
-          `✅ Premium aktif *otomatis* setelah ID dikirim.\n⏱️ Tagihan berlaku 30 menit.`
-        : `\n✅ Premium aktif *otomatis* setelah pembayaran terverifikasi (±1 menit).\n⏱️ Tagihan berlaku 30 menit.`);
+        ? `• Bayar lewat QR di atas *(khusus DANA)* atau transfer ke DANA *${DANA_NUMBER}*\n\n` +
+          `Setelah bayar, langsung kirim *ID Transaksi* DANA ke chat ini (boleh tanpa perintah), atau:\n\`.konfirmasi <ID Transaksi>\`\n\n${HOW_TO_ID}\n\n` +
+          `✅ VIP aktif *otomatis* setelah ID diterima.\n⏱️ Tagihan berlaku *5 menit* (sampai ${fmtWib(invoice.expiresAt)} WIB).`
+        : `\n✅ VIP aktif *otomatis* setelah pembayaran terverifikasi (±1 menit).\n⏱️ Tagihan berlaku *5 menit*.`);
     await sock.sendMessage(jid, qrImage ? { image: qrImage.buffer || { url: qrImage.url }, caption } : { text: caption }, { quoted: msg });
     return true;
   }
 
   if (cmd === 'konfirmasi') {
-    const ref = param.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
-    const inv = (dbMemory.pendingInvoices || []).find((i) => i.phone === senderNum && i.manual);
-    if (!inv) { await send('📭 Tidak ada tagihan aktif. Ketik `.qris` dulu.'); return true; }
-    if (inv.tries >= MAX_TRIES) { await send('⛔ Percobaan habis. Buat tagihan baru dengan `.qris`.'); return true; }
-    if (ref.length < MIN_REF_LEN) {
-      await send(`⚠️ Contoh: \`.konfirmasi <ID Transaksi>\` (min ${MIN_REF_LEN} karakter, kirim ID lengkap)\n\n${HOW_TO_ID}`);
-      return true;
-    }
-    dbMemory.usedRefs ||= {};
-    if (dbMemory.usedRefs[ref]) {
-      inv.tries += 1;
-      await saveMemory();
-      await send(`⛔ ID ini sudah pernah dipakai. Sisa percobaan: ${MAX_TRIES - inv.tries}`);
-      return true;
-    }
-    dbMemory.usedRefs[ref] = inv.orderId;
-    inv.ref = ref;
-    const done = await settleInvoice(dbMemory, saveMemory, inv.orderId, 'ID Transaksi DANA');
-    if (done && OWNER_NUMBER) {
-      await sock.sendMessage(`${OWNER_NUMBER}@s.whatsapp.net`, {
-        text:
-          `🔔 *PREMIUM AKTIF OTOMATIS*\n+${senderNum}\nNominal: ${rp(done.amount)}\nPaket: ${done.days} hari\nID DANA: ${ref}\n\n` +
-          `Cocokkan dengan mutasi DANA. Jika palsu:\n\`.delprem ${senderNum}\``,
-      }).catch(() => {});
-    }
-    return true;
+    return processProof({ sock, jid, senderNum, rawRef: param, msg, dbMemory, saveMemory });
   }
 
   if (cmd === 'cekstatus') {
-    if (isUserPremium(user)) { await send(`✅ Akun *+${senderNum}* PREMIUM AKTIF (${formatRemainingTime(user.premiumUntil - Date.now())}).`); return true; }
-    const inv = (dbMemory.pendingInvoices || []).find((i) => i.phone === senderNum);
+    if (isUserPremium(user)) { await send(`✅ Akun *+${senderNum}* VIP AKTIF hingga *${fmtWib(user.premiumUntil)} WIB* (${formatRemainingTime(user.premiumUntil - Date.now())}).`); return true; }
+    const inv = activeInvoice(dbMemory, senderNum);
     await send(inv
-      ? `⏳ Tagihan \`${inv.orderId}\` *${rp(inv.amount)}* (${inv.days} hari) menunggu pembayaran.\nKirim \`.konfirmasi <ID Transaksi>\` setelah bayar.`
+      ? `⏳ Tagihan \`${inv.orderId}\` *${rp(inv.amount)}* (${inv.days} hari) menunggu pembayaran.\nKirim ID Transaksi setelah bayar. Berlaku sampai ${fmtWib(inv.expiresAt)} WIB.`
       : '📭 Tidak ada tagihan aktif. Ketik `.qris` untuk melihat paket.');
     return true;
   }
 
   if ((cmd === 'accprem' || cmd === 'addprem') && isOwner) {
     if (/^PREM-/i.test(param)) {
-      const inv = await settleInvoice(dbMemory, saveMemory, param.split(/\s+/)[0], 'Verifikasi Owner');
-      await send(inv ? `✅ +${inv.phone} aktif Premium ${inv.days} hari.` : '❌ Invoice tidak ditemukan / sudah diproses.');
+      const inv = await settleInvoice(dbMemory, saveMemory, param.split(/\s+/)[0], 'Verifikasi Owner', { quoted: msg }).catch(() => null);
+      await send(inv ? `✅ +${inv.phone} aktif VIP ${inv.days} hari.` : '❌ Invoice tidak ditemukan / sudah diproses.');
       return true;
     }
     const [t, d] = param.split(/\s+/);
@@ -344,16 +431,27 @@ export async function handlePremiumCommand({ sock, jid, senderNum, isOwner, isSe
     const days = Number(d) || 2;
     if (!target) { await send('⚠️ Contoh: `.accprem PREM-1234-567890` atau `.addprem 628123456789 30`'); return true; }
     await activatePremiumForNumber(sock, dbMemory, saveMemory, target, days, 'Verifikasi Owner');
-    await send(`✅ Nomor *+${target}* diaktifkan Premium *${days} hari*.`);
+    await send(`✅ Nomor *+${target}* diaktifkan VIP *${days} hari*.`);
     return true;
   }
 
   if (cmd === 'delprem' && isOwner) {
     const target = param.replace(/\D/g, '');
     if (!target) return true;
-    ensureUserRecord(dbMemory, target).premiumUntil = 0;
+    const u = ensureUserRecord(dbMemory, target);
+    u.premiumUntil = 0;
     await saveMemory();
-    await send(`🗑️ Premium *+${target}* dinonaktifkan.`);
+    await send(`🗑️ VIP *+${target}* dinonaktifkan.`);
+    return true;
+  }
+
+  if (cmd === 'listprem' && isOwner) {
+    const now = Date.now();
+    const rows = Object.entries(dbMemory.users || {})
+      .filter(([, u]) => u.premiumUntil > now)
+      .sort((a, b) => b[1].premiumUntil - a[1].premiumUntil)
+      .map(([p, u], i) => `${i + 1}. +${p} — ${formatRemainingTime(u.premiumUntil - now)} (s/d ${fmtWib(u.premiumUntil)})`);
+    await send(rows.length ? `💎 *MEMBER VIP AKTIF (${rows.length})*\n\n${rows.join('\n')}` : '📭 Belum ada member VIP aktif.');
     return true;
   }
 
