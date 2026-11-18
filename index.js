@@ -1,3 +1,4 @@
+// ═════════ index.js (FULL) ═════════
 import fs from 'fs';
 import fsPromises from 'fs/promises';
 import os from 'os';
@@ -9,6 +10,7 @@ import { mulaiWeb } from './web.js';
 import { restoreAuthFromGitHub, scheduleAuthBackupToGitHub, startGitHubLiveHotReload, setupGracefulShutdown } from './github_sync.js';
 import { ALL_GROUP_COMMANDS, GROUP_AUTO_ONLY_COMMANDS, GROUP_SECURITY_MENU, isSenderGroupAdmin, handleGroupMessageGuard, handleGroupCommand, handleGroupParticipantsUpdate, handleGroupJoinRequestEvent, startGroupAutomationScheduler, handleGroupThemeInteraction } from './group_automation.js';
 import { PREMIUM_COMMANDS, PREMIUM_PACKAGES, LIMIT_EXEMPT_COMMANDS, ensureUserRecord, isUserPremium, formatRemainingTime, checkAndConsumeDailyLimit, handlePremiumCommand, startPremiumAndQrisWatcher, handlePremiumProofText } from './premium_limit.js';
+import { GAME_COMMANDS, handleGameInput, handleGameCommand } from './handler.js';
 import { DOWNLOAD_COMMANDS, DOWNLOAD_MENU, handleDownloadCommand, handleDirectUrlAutoDownload, fetchWithTimeout, fetchBuffer, extractUrl, mediaBufferToWebpSticker, createBratSticker, urlOrTextToWebpSticker, extractAndDownloadViewOnce, sendNativeInteractiveButtons, panggilServerAISatSet, getAnimeImageUrl } from './engines.js';
 
 /* ═════════════════════════ KONFIGURASI & STATE ═════════════════════════ */
@@ -29,12 +31,11 @@ const bot = {
 
 let dbMemory = {
   version: 10.0, lastUpdateDate: '', updateLogs: [], users: {}, pendingInvoices: [],
-  learnedWords: [], notes: {}, groupSettings: {}, gameHighScores: { kuroslash: {}, sonic: {} },
+  learnedWords: [], notes: {}, groupSettings: {}, gameProfiles: {},
   botSettings: { mode: 'public', autoread: false, autotyping: true, customBotName: '' },
   healthReport: { lastChecked: '-', summary: 'Modular Group Security + Multi-Engine Downloader', details: {}, autoRepairs: [], totalRepairs: 0 },
 };
 
-const gameSessions = new Map();
 const sentMessageCache = new Map();
 const lastReplyTextByJid = new Map();
 const retryCooldownByJid = new Map();
@@ -46,7 +47,7 @@ const MENU_CATEGORIES = {
   AI: ['ai', 'gpt', 'ask', 'tanya', 'gemini', 'chatgpt', 'simi', 'cerita', 'puisi', 'pantun', 'kode', 'coding', 'ringkas', 'memori', 'resetmemori'],
   SEARCH: ['cuaca', 'wthr', 'setlokasi', 'lokasi', 'praytime', 'surah', 'wiki', 'npm', 'define', 'fakta', 'motivasi', 'kbbi'],
   ANIME: ['waifu', 'neko', 'shinobu', 'megumin', 'cuddle', 'cry', 'kiss', 'lick', 'bonk', 'yeet', 'blush', 'smile', 'highfive', 'handhold', 'nom', 'bite', 'glomp', 'slap', 'kill', 'kickanime', 'happy', 'wink', 'poke', 'cringe'],
-  FUN: ['kuroslash', 'slash', 'sonic', 'speedydash', 'game', 'mathgame', 'tebakkata', 'suit', 'dice', 'coin', '8ball', 'rate', 'aura', 'sigma', 'rizz', 'vibe', 'npc', 'maincharacter', 'delulu', 'redflag', 'greenflag', 'compatibility', 'ship', 'roast', 'compliment', 'pickup', 'quote', 'joke', 'truth', 'dare', 'wyr', 'horoscope', 'hug', 'pat', 'wave', 'dance'],
+  FUN: GAME_COMMANDS,
   STICKER_LOGO: ['sticker', 'stiker', 's', 'brat', 'bratvid', 'bratvideo', 'ttp', 'attp', 'qc', 'animasi', 'linkvideo', 'font', 'fancy', 'logo', 'neon', 'gold', 'galaxy', 'glitch', 'matrix', 'graffiti', 'thunder'],
   TOOLS: ['rvo', 'rvop', 'vv', 'hitung', 'catat', 'catatan', 'terjemah', 'translate', 'id', 'getpp', 'getbio', 'gpass', 'qr', 'shorturl', 'waktu', 'base64', 'reverse', 'ssweb', 'fixsession'],
   OWNER: ['setnama', 'setname', 'botname', 'updatebio', 'block', 'unblock', 'blocklist', 'autoread', 'autotyping', 'mode', 'badwords', 'addkata', 'delkata', 'clean'],
@@ -70,7 +71,7 @@ const MENU_GROUPS = [
 ];
 
 const SUB_MENU = { groupmenu: 'security', aimenu: 'ai', searchmenu: 'search', animemenu: 'anime', funmenu: 'fun', logomenu: 'logo', toolsmenu: 'tools', ownermenu: 'owner', downloadmenu: 'download', dlmenu: 'download' };
-['allmenu', ...Object.keys(SUB_MENU)].forEach((c) => LIMIT_EXEMPT_COMMANDS.add(c)); // navigasi menu tidak memakai limit
+['allmenu', 'gameprofil', 'gametop', 'gamedaily', 'stopgame', ...Object.keys(SUB_MENU)].forEach((c) => LIMIT_EXEMPT_COMMANDS.add(c)); // navigasi menu & profil game tidak memakai limit
 
 const ALL_COMMANDS_SET = new Set([...Object.values(MENU_CATEGORIES).flat(), ...DOWNLOAD_COMMANDS, ...ALL_GROUP_COMMANDS, ...PREMIUM_COMMANDS]);
 
@@ -120,7 +121,6 @@ async function loadMemory() {
       pendingInvoices: Array.isArray(p.pendingInvoices) ? p.pendingInvoices : [],
       botSettings: { ...dbMemory.botSettings, ...(p.botSettings || {}) },
       healthReport: { ...dbMemory.healthReport, ...(p.healthReport || {}) },
-      gameHighScores: { kuroslash: { ...(p.gameHighScores?.kuroslash || {}) }, sonic: { ...(p.gameHighScores?.sonic || {}) } },
     });
     if (dbMemory.botSettings.customBotName) bot.userName = dbMemory.botSettings.customBotName;
   } catch { await saveMemory(); }
@@ -350,70 +350,6 @@ async function handleMenuCommand(c) {
   return true;
 }
 
-/* ═════════════════════════ GAME ═════════════════════════ */
-
-const kirimTampilanKuroSlash = (sock, jid, num, st, text, quoted) => sendNativeInteractiveButtons(sock, jid, {
-  title: '⚔️ KURO SLASH — DEMON HUNTER',
-  body: `👤 Pemain: @${num}\n❤️ HP: ${st.hp}% | ⚡ ULTI: ${st.ulti}%\n🏆 Skor: *${st.score}* (Best: ${st.best})\n\nArena: [ ${['⬜', '⬜', '⬜'].map((x, i) => (i === st.lane ? '🥷' : x)).join(' | ')} ]\n💬 _${text}_`,
-  buttons: [{ text: '⬅️ KIRI', id: 'kiri' }, { text: '⚔️ TEBAS', id: 'tebas' }, { text: '➡️ KANAN', id: 'kanan' }],
-}, quoted);
-
-const kirimTampilanSonic = (sock, jid, num, st, text, quoted) => sendNativeInteractiveButtons(sock, jid, {
-  title: '🌀 SPEEDY DASH — SONIC RUN',
-  body: `👤 Pemain: @${num}\n💍 Gold Rings: *${st.rings}* | 🏆 Skor: *${st.score}* (Best: ${st.best})\n${st.laserAlert ? '⚠️ *AWAS LASER DI DEPAN! TEKAN JUMP!*' : '🛣️ Lintasan aman untuk nge-boost!'}\n\n💬 _${text}_`,
-  buttons: [{ text: '⚡ BOOST', id: 'boost' }, { text: '⬆️ JUMP', id: 'jump' }, { text: '🛑 STOP', id: 'stopgame' }],
-}, quoted);
-
-const setBest = (game, num, s) => (s.best = dbMemory.gameHighScores[game][num] = Math.max(dbMemory.gameHighScores[game][num] || 0, s.score));
-
-async function handleGameInput({ sock, jid, msg, rawText, textLower, senderNum, reply }) {
-  const s = gameSessions.get(jid);
-  if (!s) return false;
-  const act = textLower.replace(/^[.!/#]/, '').trim();
-
-  if (act === 'stopgame') { gameSessions.delete(jid); await reply('🛑 Permainan dihentikan.'); return true; }
-
-  if (s.type === 'kuroslash' && ['kiri', 'tebas', 'kanan', 'ulti'].includes(act)) {
-    s.wave = (s.wave || 0) + 1;
-    const move = (d, label) => { s.lane = Math.min(2, Math.max(0, s.lane + d)); s.score += 65; s.ulti = Math.min(100, s.ulti + 15); return `Bergerak ke jalur ${label} (+65)!`; };
-    let ev;
-    if (act === 'kiri') ev = move(-1, 'KIRI');
-    else if (act === 'kanan') ev = move(1, 'KANAN');
-    else if (act === 'tebas') { s.score += 150; s.ulti = Math.min(100, s.ulti + 25); ev = '⚔️ TEBASAN TELAK! Oni ter-PARRY (+150)!'; }
-    else if (s.ulti >= 100) { s.score += 450; s.ulti = 0; ev = '🌊 GELOMBANG ULTI TERLEPAS (+450)!'; }
-    else ev = `⚠️ ULTI baru ${s.ulti}% — tekan TEBAS untuk mengisi!`;
-    setBest('kuroslash', senderNum, s);
-    await saveMemory();
-    await kirimTampilanKuroSlash(sock, jid, senderNum, s, ev, msg);
-    return true;
-  }
-  if (s.type === 'sonic' && ['boost', 'jump'].includes(act)) {
-    const add = rand(7) + 5;
-    s.rings += add; s.score += add * 35; s.laserAlert = act === 'boost' ? Math.random() < 0.45 : false;
-    setBest('sonic', senderNum, s);
-    await saveMemory();
-    await kirimTampilanSonic(sock, jid, senderNum, s, `${act === 'boost' ? '⚡ BOOST' : '⬆️ JUMP'}! +${add} Gold Rings!`, msg);
-    return true;
-  }
-  if (s.type === 'angka' && /^[0-9]+$/.test(rawText)) {
-    const g = parseInt(rawText, 10);
-    if (g === s.answer) { gameSessions.delete(jid); await reply(`🎉 *BENAR!* Angkanya *${s.answer}*.`); }
-    else await reply(g < s.answer ? '⬆️ Terlalu KECIL!' : '⬇️ Terlalu BESAR!');
-    return true;
-  }
-  if (s.type === 'math' && /^-?[0-9]+$/.test(rawText)) {
-    gameSessions.delete(jid);
-    await reply(parseInt(rawText, 10) === s.answer ? `🎉 *TEPAT!* Jawabannya *${s.answer}*.` : `❌ Salah! Jawaban: *${s.answer}*.`);
-    return true;
-  }
-  if (s.type === 'kata' && !ALL_COMMANDS_SET.has(act)) {
-    gameSessions.delete(jid);
-    await reply(textLower === s.answer ? `🎉 *BENAR!* Jawabannya *${s.answer}*.` : `❌ Salah! Jawaban: *${s.answer}*.`);
-    return true;
-  }
-  return false;
-}
-
 /* ═════════════════════════ REGISTRI PERINTAH ═════════════════════════ */
 // on(nama|[nama], handler, { owner, admin, usage })
 
@@ -425,7 +361,6 @@ const QUOTED = (c) => c.unwrapped.extendedTextMessage?.contextInfo?.quotedMessag
 
 const FONT_MAPS = [119737, 119789, 119841, 120003, 120367].map((off) => (t) => t.replace(/[A-Za-z]/g, (ch) => String.fromCodePoint(ch.charCodeAt(0) + (ch <= 'Z' ? off : off - 6))));
 const LOGO = { logo: '0f172a/38bdf8', neon: '090d16/00ffcc', gold: '1c1917/facc15', galaxy: '1e1b4b/c084fc', glitch: '18181b/f43f5e', matrix: '022c22/4ade80', graffiti: '312e81/fb923c', thunder: '0c4a6e/fde047' };
-const RATE_CMDS = ['rate', 'aura', 'sigma', 'rizz', 'vibe', 'npc', 'maincharacter', 'delulu', 'redflag', 'greenflag', 'compatibility', 'ship'];
 const AI_PERSONA = () => `Kamu adalah ${bot.userName}. Jawab singkat, cerdas, dan akurat dalam Bahasa Indonesia.`;
 
 /* ── Sistem ── */
@@ -485,35 +420,11 @@ on('npm', async ({ param, reply }) => {
 }, { usage: 'baileys' });
 on(['define', 'fakta', 'motivasi', 'kbbi'], async ({ cmd, param, reply }) => reply((await askAI(`Berikan ${cmd} untuk "${param || 'Indonesia'}" secara singkat dalam Bahasa Indonesia.`, 'Jawab akurat dan ringkas.')) || '❌ Data tidak tersedia.'));
 
-/* ── Anime, game & hiburan ── */
+/* ── Anime (game & hiburan ada di handler.js) ── */
 on(MENU_CATEGORIES.ANIME, async ({ cmd, reply, send }) => {
   const u = await getAnimeImageUrl(cmd);
   return u ? send({ image: { url: u }, caption: `✨ *${cmd.toUpperCase()}*` }) : reply('❌ Gambar tidak tersedia.');
 });
-on(['hug', 'pat', 'wave', 'dance'], async ({ cmd, pushName, reply, send }) => {
-  const u = await getAnimeImageUrl(cmd);
-  return u ? send({ image: { url: u }, caption: `*${pushName}* melakukan *${cmd}*` }) : reply('❌ Gambar tidak tersedia.');
-});
-on(['kuroslash', 'slash'], ({ sock, jid, msg, senderNum }) => {
-  const st = { type: 'kuroslash', lane: 1, hp: 100, score: 0, best: dbMemory.gameHighScores.kuroslash[senderNum] || 0, ulti: 35, wave: 0 };
-  gameSessions.set(jid, st);
-  return kirimTampilanKuroSlash(sock, jid, senderNum, st, 'Tekan tombol di bawah untuk bermain!', msg);
-});
-on(['sonic', 'speedydash'], ({ sock, jid, msg, senderNum }) => {
-  const st = { type: 'sonic', rings: 10, score: 0, best: dbMemory.gameHighScores.sonic[senderNum] || 0, laserAlert: false };
-  gameSessions.set(jid, st);
-  return kirimTampilanSonic(sock, jid, senderNum, st, 'Tekan BOOST atau JUMP di bawah!', msg);
-});
-on('game', ({ jid, reply }) => { gameSessions.set(jid, { type: 'angka', answer: rand(10) + 1 }); return reply('🎮 *Tebak Angka 1 sampai 10*\nKirim tebakanmu!'); });
-on('mathgame', ({ jid, reply }) => { const a = rand(25) + 5, b = rand(25) + 5; gameSessions.set(jid, { type: 'math', answer: a + b }); return reply(`🧮 Berapa *${a} + ${b}*?`); });
-on('tebakkata', ({ jid, reply }) => { gameSessions.set(jid, { type: 'kata', answer: 'peta' }); return reply('🧩 Punya gunung tapi tidak punya pohon, punya kota tapi tidak punya rumah. Apakah aku?'); });
-on('suit', ({ param, reply }) => { const o = ['batu', 'gunting', 'kertas'], u = param.toLowerCase(); return reply(o.includes(u) ? `✊✌️✋ Kamu: *${u}* | Bot: *${pick(o)}*` : '⚠️ Contoh: `.suit batu`'); });
-on('dice', ({ reply }) => reply(`🎲 Dadu: *${rand(6) + 1}*`));
-on('coin', ({ reply }) => reply(`🪙 Koin: *${pick(['ANGKA', 'GAMBAR'])}*`));
-on('8ball', ({ reply }) => reply(`🎱 *${pick(['Ya pasti!', 'Mungkin iya.', 'Coba lagi.', 'Tidak.'])}*`));
-on(RATE_CMDS, ({ cmd, reply }) => reply(`📊 *${cmd.toUpperCase()}:* ${rand(101)}%`));
-on(['roast', 'compliment', 'pickup', 'quote', 'joke', 'truth', 'dare', 'wyr', 'horoscope'], async ({ cmd, param, pushName, reply }) =>
-  reply((await askAI(`Buat 1 ${cmd} singkat dan sopan dalam Bahasa Indonesia untuk ${param || pushName}.`, 'Jawab singkat.')) || '✨ Semangat hari ini!'));
 
 /* ── Stiker & logo ── */
 on(['sticker', 'stiker', 's'], async (c) => {
@@ -648,7 +559,7 @@ async function prosesSatuPesan(sock, msg) {
     const reply = (text) => sock.sendMessage(jid, { text }, { quoted: msg });
     const send = (content) => sock.sendMessage(jid, content, { quoted: msg });
     const limit = (cmd) => checkAndConsumeDailyLimit({ sock, jid, senderNum, isOwner, isSenderAdmin, cmd, msg, dbMemory, saveMemory });
-    const c = { sock, jid, msg, isGroup, isOwner, isSenderAdmin, senderNum, rawParticipant, pushName, unwrapped, rawText, textLower, reply, send };
+    const c = { sock, jid, msg, isGroup, isOwner, isSenderAdmin, senderNum, rawParticipant, pushName, unwrapped, rawText, textLower, reply, send, dbMemory, saveMemory, isCommand: (x) => ALL_COMMANDS_SET.has(x) };
 
     if (isGroup && await handleGroupMessageGuard({ sock, jid, msg, rawText, textLower, senderParticipant: rawParticipant, senderNum, isSenderAdmin, isOwner, bot, dbMemory })) return;
 
@@ -698,6 +609,7 @@ async function prosesSatuPesan(sock, msg) {
       if (await handlePremiumCommand({ sock, jid, senderNum, isOwner, isSenderAdmin, cmd, param, msg, dbMemory, saveMemory })) return;
       if (await handleGroupCommand({ sock, jid, isGroup, senderParticipant: rawParticipant, senderNum, isOwner, isSenderAdmin, cmd, param, unwrapped, msg, dbMemory, saveMemory })) return;
       if (await handleDownloadCommand({ sock, jid, cmd, param, msg })) return;
+      if (await handleGameCommand(cc)) return;
       if (await runCommand(cc)) return;
     }
 
