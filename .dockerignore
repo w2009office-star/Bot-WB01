@@ -1,0 +1,7 @@
+node_modules
+.git
+auth
+.env
+memory.json
+*.log
+.DS_Store
