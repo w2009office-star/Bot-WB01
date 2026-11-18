@@ -1,7 +1,7 @@
 import { fetchWithTimeout, sendNativeInteractiveButtons, panggilServerAISatSet } from './engines.js';
 
 export const GROUP_SECURITY_COMMANDS = [
-  'antilink', 'antivirtek', 'antibug', 'antitoxic', 'antispam',
+  'antilink', 'antivirtek', 'antibug', 'antitoxic', 'antispam', 'antitagstatus',
   'autoacc', 'autoapprove', 'acc', 'accsemua', 'tolaksemua', 'cekrequest',
   'wajibpp', 'kode', 'setfilter', 'bl', 'unbl', 'blacklistmember', 'unblacklistmember',
   'kick', 'add', 'promote', 'demote', 'del', 'delete',
@@ -11,7 +11,7 @@ export const GROUP_SECURITY_COMMANDS = [
 export const GROUP_AUTO_ONLY_COMMANDS = [
   'groupsettings', 'gsettings', 'tagall', 'everyone', 'hidetag', 'updategname', 'updategdesc',
   'poll', 'leave', 'welcome', 'goodbye', 'setwelcome', 'setgoodbye', 'autobuka', 'autotutup',
-  'tambahkegiatan', 'syncjadwal', 'listkegiatan', 'hapuskegiatan', 'teskegiatan',
+  'tambahkegiatan', 'jadwal', 'syncjadwal', 'listkegiatan', 'hapuskegiatan', 'teskegiatan',
   'tessemuakegiatan', 'testsemuakegiatan', 'interaksi', 'settema', 'tutupinteraksi', 'panelgrup',
 ];
 
@@ -29,7 +29,8 @@ export const GROUP_SECURITY_MENU =
   `• \`.antivirtek on/off\`\n` +
   `• \`.antibug on/off\`\n` +
   `• \`.antitoxic on/off\`\n` +
-  `• \`.antispam on/off\`\n\n` +
+  `• \`.antispam on/off\`\n` +
+  `• \`.antitagstatus on/off\`\n\n` +
   `*🛡️ SELEKSI & ACC MEMBER*\n` +
   `• \`.autoacc on/off\`\n` +
   `• \`.acc @nomor\`\n` +
@@ -56,6 +57,23 @@ const VALID_DAYS = ['senin', 'selasa', 'rabu', 'kamis', 'jumat', 'sabtu', 'mingg
 const EN_TO_ID_DAY = { sunday: 'minggu', monday: 'senin', tuesday: 'selasa', wednesday: 'rabu', thursday: 'kamis', friday: 'jumat', saturday: 'sabtu' };
 const GRACE_MINUTES = 2;
 const SESSION_MS = 3 * 3600 * 1000;
+
+const JADWAL_USAGE =
+  `╭───〔 🗓️ JADWAL 〕───\n` +
+  `│ .jadwal <kapan> <jam> <teks>\n` +
+  `│\n` +
+  `│ 🔁 PENGULANGAN\n` +
+  `│ • Harian   → .jadwal 07:00 Selamat pagi\n` +
+  `│ • Mingguan → .jadwal senin 19:00 Rapat\n` +
+  `│ • Bulanan  → .jadwal 15 19:00 Iuran kas\n` +
+  `│ • Tahunan  → .jadwal 17/8 08:00 Selamat HUT\n` +
+  `│ • Per jam  → .jadwal jam :30 Minum air\n` +
+  `│\n` +
+  `│ ⚙️ KELOLA\n` +
+  `│ • .jadwal           → daftar\n` +
+  `│ • .jadwal hapus 2   → hapus\n` +
+  `│ • .jadwal tes 2     → tes kirim\n` +
+  `╰──────────────────────`;
 
 const botSentMsgIds = new Set();
 const groupChatHistory = new Map();
@@ -175,6 +193,7 @@ export function ensureGroupAutoConfig(dbMemory, jid) {
   cfg.antibug = cfg.antibug ?? true;
   cfg.antitoxic = cfg.antitoxic ?? true;
   cfg.antispam = cfg.antispam ?? true;
+  cfg.antitagstatus = cfg.antitagstatus ?? true;
   cfg.welcome = Boolean(cfg.welcome);
   cfg.goodbye = cfg.goodbye ?? cfg.welcome;
   cfg.welcomeText ||= '👋 Selamat datang @user di *@group*!\n\n📌 *Info Grup:*\n@desc\n\nTotal member sekarang: *@count* orang.';
@@ -228,6 +247,9 @@ const DL_CMDS = new Set('tiktok tt ttmp3 yt youtube ytmp3 ytmp4 yta ytv play ig 
 const DL_HOSTS = /^(?:[\w-]+\.)*(?:tiktok|capcut|youtube|instagram|facebook|fb|twitter|x|mediafire|github|spotify)\.com$|^(?:youtu\.be|fb\.watch|drive\.google\.com)$/i;
 const LINK_RE = /(https?:\/\/|www\.|chat\.whatsapp\.com|wa\.me\/)/i;
 const LINK_TOKEN = /(?:https?:\/\/|www\.)\S+|(?:chat\.whatsapp\.com|wa\.me)\/\S*/gi;
+const STATUS_TAG_RE = /^(groupStatusMentionMessage|groupMentionedMessage|statusMentionMessage)$/;
+const hasStatusTag = (m, d = 0) => d < 4 && m && typeof m === 'object' &&
+  Object.entries(m).some(([k, v]) => STATUS_TAG_RE.test(k) || (v && typeof v === 'object' && v.message && hasStatusTag(v.message, d + 1)));
 const clean = (arr, min = 1) => arr.map((w) => String(w ?? '').toLowerCase().trim()).filter((w) => w.length >= min);
 const hostOf = (u) => { try { return new URL(/^https?:/i.test(u) ? u : `https://${u}`).hostname; } catch { return ''; } };
 
@@ -257,12 +279,13 @@ function detectViolation({ text, lower, cfg, bot, dbMemory, jid, spamKey }) {
 export async function handleGroupMessageGuard({ sock, jid, msg, rawText, textLower, senderParticipant, senderNum, isSenderAdmin, isOwner = false, bot, dbMemory }) {
   try {
     if (!jid?.endsWith('@g.us') || msg?.key?.fromMe || isOwner) return false;
-    const text = typeof rawText === 'string' ? rawText : '';
-    if (!text) return false;
-    const lower = typeof textLower === 'string' ? textLower : text.toLowerCase();
     const cfg = ensureGroupAutoConfig(dbMemory, jid);
+    const text = typeof rawText === 'string' ? rawText : '';
+    const tagStatus = cfg.antitagstatus && hasStatusTag(msg?.message);
+    if (!text && !tagStatus) return false;
+    const lower = typeof textLower === 'string' ? textLower : text.toLowerCase();
 
-    const violation = detectViolation({ text, lower, cfg, bot, dbMemory, jid, spamKey: senderNum || jidDigits(senderParticipant) });
+    const violation = tagStatus ? 'tagstatus' : detectViolation({ text, lower, cfg, bot, dbMemory, jid, spamKey: senderNum || jidDigits(senderParticipant) });
     if (!violation) return false;
 
     // 👑 VVIP: admin tidak pernah dihapus pesannya / di-kick oleh sistem anti-*
@@ -276,6 +299,8 @@ export async function handleGroupMessageGuard({ sock, jid, msg, rawText, textLow
       bump(bot?.stats, 'totalDeletedBadWords');
     } else if (violation === 'link') {
       bump(bot?.stats, 'totalDeletedLinks');
+    } else if (violation === 'tagstatus') {
+      bump(bot?.stats, 'totalDeletedTagStatus');
     }
     return true;
   } catch (e) {
@@ -434,7 +459,7 @@ async function executeGroupActivity(sock, jid, activity, dbMemory = null, saveMe
   const type = String(activity.type || 'jadwal').toLowerCase();
   const content = String(activity.content || '');
   const dayName = (normalizeDay(activity.day) || 'setiap_hari').toUpperCase();
-  const dayLabel = dayName !== 'SETIAP_HARI' ? ` (${dayName})` : '';
+  const dayLabel = (dayName !== 'SETIAP_HARI' ? ` (${dayName})` : '') + (activity.repeat ? ` 🔁 ${activity.repeat.toUpperCase()}${activity.date ? ` ${activity.date}` : ''}` : '');
   const timeLabel = normalizeTime(activity.time) || activity.time || '';
   const cleanTopic = content.replace(/^ai:/i, '').trim();
   let sentMain = null;
@@ -468,7 +493,8 @@ async function executeGroupActivity(sock, jid, activity, dbMemory = null, saveMe
       promptSummary = materiText;
     }
   } else {
-    sentMain = await sock.sendMessage(jid, { text: `🗓️ *PENGINGAT JADWAL GRUP*${dayLabel}\n⏰ Pukul ${timeLabel} WIB\n\n${content}` });
+    const when = activity.repeat === 'jam' ? `Menit :${timeLabel.slice(3)} (tiap jam)` : `Pukul ${timeLabel} WIB`;
+    sentMain = await sock.sendMessage(jid, { text: `🗓️ *PENGINGAT JADWAL GRUP*${dayLabel}\n⏰ ${when}\n\n${content}` });
   }
 
   trackBotMessage(sentMain);
@@ -539,8 +565,23 @@ function isDue(timeStr, nowStr) {
   return diff >= 0 && diff <= GRACE_MINUTES;
 }
 
+const dueDiff = (act, nowStr) => {
+  const t = normalizeTime(act.time);
+  if (!t) return -1;
+  const n = minutesOfDay(nowStr), s = minutesOfDay(t);
+  return act.repeat === 'jam' ? (n - s + 60) % 60 : n - s;
+};
+
+function isActDay(act, day, date) {
+  const [, mo, d] = date.split('-').map(Number);
+  if (act.repeat === 'bulan') return Number(act.date) === d;
+  if (act.repeat === 'tahun') return act.date === `${d}-${mo}`;
+  const a = normalizeDay(act.day);
+  return a === 'setiap_hari' || a === day;
+}
+
 function activityKey(act) {
-  const raw = `${normalizeDay(act.day)}|${normalizeTime(act.time)}|${act.type}|${act.content}`;
+  const raw = `${normalizeDay(act.day)}|${normalizeTime(act.time)}|${act.type}|${act.content}|${act.repeat || ''}|${act.date || ''}`;
   let h = 0;
   for (let i = 0; i < raw.length; i++) h = (h * 31 + raw.charCodeAt(i)) | 0;
   return `act:${(h >>> 0).toString(36)}`;
@@ -587,9 +628,9 @@ async function schedulerTick() {
         for (const act of cfg.activities) {
           const key = activityKey(act);
           liveKeys.add(key);
-          const actDay = normalizeDay(act.day);
-          const stamp = `${todayWib} ${normalizeTime(act.time)}`;
-          if (!(actDay === 'setiap_hari' || actDay === todayDay) || !isDue(act.time, nowWib) || cfg.runLog[key] === stamp) continue;
+          const diff = dueDiff(act, nowWib);
+          const stamp = `${todayWib} ${minutesOfDay(nowWib) - diff}`;
+          if (diff < 0 || diff > GRACE_MINUTES || !isActDay(act, todayDay, todayWib) || cfg.runLog[key] === stamp) continue;
           cfg.runLog[key] = stamp;
           dirty = true;
           await executeGroupActivity(sock, jid, act, dbMemory, saveMemory).catch((e) => logErr(`kegiatan ${act.time}`, e));
@@ -639,6 +680,48 @@ function parseScheduleFromDesc(desc) {
   return out;
 }
 
+const isHM = (s) => /^\d{1,2}[:.]\d{2}$/.test(s || '');
+
+// .jadwal <kapan> <jam> <teks> → harian | minggu | bulan | tahun | jam
+function parseJadwal(param) {
+  const t = String(param).trim().split(/\s+/);
+  const a = (t[0] || '').toLowerCase();
+  const b = t[1] || '';
+  const act = { day: 'setiap_hari', type: 'jadwal', repeat: '' };
+  let time;
+  let rest;
+  if (a === 'jam') {
+    const m = b.match(/^:?(\d{1,2})$/);
+    if (!m || +m[1] > 59) return null;
+    time = `00:${m[1].padStart(2, '0')}`;
+    act.repeat = 'jam';
+    rest = t.slice(2);
+  } else if (isHM(a)) {
+    time = normalizeTime(a);
+    rest = t.slice(1);
+  } else if (isHM(b)) {
+    time = normalizeTime(b);
+    rest = t.slice(2);
+    let m;
+    if (/^[a-z_]+$/.test(a)) {
+      act.day = normalizeDay(a);
+      act.repeat = 'minggu';
+      if (!act.day) return null;
+    } else if (/^\d{1,2}$/.test(a)) {
+      if (+a < 1 || +a > 31) return null;
+      act.repeat = 'bulan';
+      act.date = String(+a);
+    } else if ((m = a.match(/^(\d{1,2})[/-](\d{1,2})$/))) {
+      if (!+m[1] || +m[1] > 31 || !+m[2] || +m[2] > 12) return null;
+      act.repeat = 'tahun';
+      act.date = `${+m[1]}-${+m[2]}`;
+    } else return null;
+  } else return null;
+  act.time = time;
+  act.content = rest.join(' ');
+  return time && act.content ? act : null;
+}
+
 function resolveTarget(unwrapped, param) {
   const ctx = getContextInfo(unwrapped);
   if (ctx?.mentionedJid?.[0]) return ctx.mentionedJid[0];
@@ -669,7 +752,7 @@ export async function handleGroupCommand(ctx) {
 }
 
 async function runGroupCommand({ sock, jid, isGroup, senderParticipant, senderNum, isOwner, isSenderAdmin, cmd, param: rawParam, unwrapped, msg, dbMemory, saveMemory }) {
-  const param = typeof rawParam === 'string' ? rawParam.trim() : '';
+  let param = typeof rawParam === 'string' ? rawParam.trim() : '';
   const reply = (text, extra = {}) => sock.sendMessage(jid, { text, ...extra }, { quoted: msg });
   const save = async () => { if (typeof saveMemory === 'function') await saveMemory(); };
 
@@ -694,7 +777,7 @@ async function runGroupCommand({ sock, jid, isGroup, senderParticipant, senderNu
   if (['ginfo', 'groupsettings', 'gsettings'].includes(cmd)) {
     await sendMenu(sock, jid, {
       title: '🛡️ KEAMANAN & PENGATURAN GRUP',
-      body: `📌 *Grup:* ${meta?.subject || 'Grup'}\n• Anti-Link: *${cfg.antilink ? 'ON' : 'OFF'}* | Anti-Virtek: *${cfg.antivirtek ? 'ON' : 'OFF'}*\n• Anti-Toxic: *${cfg.antitoxic ? 'ON' : 'OFF'}* | Anti-Spam: *${cfg.antispam ? 'ON' : 'OFF'}*\n• Welcome: *${cfg.welcome ? 'ON' : 'OFF'}* | Auto ACC: *${cfg.memberFilter.enabled ? 'ON' : 'OFF'}*\n• Wajib PP: *${cfg.memberFilter.requirePhoto ? 'ON' : 'OFF'}* | Kode: *${cfg.memberFilter.allowedPrefixes.join(', ') || 'Semua'}*\n• 👑 VVIP Admin: *AKTIF* (kebal kick & demote)`,
+      body: `📌 *Grup:* ${meta?.subject || 'Grup'}\n• Anti-Link: *${cfg.antilink ? 'ON' : 'OFF'}* | Anti-Virtek: *${cfg.antivirtek ? 'ON' : 'OFF'}*\n• Anti-Toxic: *${cfg.antitoxic ? 'ON' : 'OFF'}* | Anti-Spam: *${cfg.antispam ? 'ON' : 'OFF'}*\n• Anti-Tag Status: *${cfg.antitagstatus ? 'ON' : 'OFF'}*\n• Welcome: *${cfg.welcome ? 'ON' : 'OFF'}* | Auto ACC: *${cfg.memberFilter.enabled ? 'ON' : 'OFF'}*\n• Wajib PP: *${cfg.memberFilter.requirePhoto ? 'ON' : 'OFF'}* | Kode: *${cfg.memberFilter.allowedPrefixes.join(', ') || 'Semua'}*\n• 👑 VVIP Admin: *AKTIF* (kebal kick & demote)`,
       buttons: [
         { text: '🛡️ Menu Keamanan', id: 'keamanangrup' },
         { text: '🔗 Toggle Anti-Link', id: 'antilink' },
@@ -724,6 +807,7 @@ async function runGroupCommand({ sock, jid, isGroup, senderParticipant, senderNu
     antibug: ['antibug', '🐞 Anti-Bug'],
     antitoxic: ['antitoxic', '🤬 Anti-Toxic'],
     antispam: ['antispam', '⚡ Anti-Spam'],
+    antitagstatus: ['antitagstatus', '📢 Anti-Tag Status'],
     welcome: ['welcome', '👋 Welcome Masuk'],
     goodbye: ['goodbye', '🚪 Goodbye Keluar'],
   };
@@ -848,7 +932,7 @@ async function runGroupCommand({ sock, jid, isGroup, senderParticipant, senderNu
     const cur = resolveTodayTheme(cfg);
     await sendMenu(sock, jid, {
       title: '⚙️ PANEL OTOMATISASI & KEAMANAN GRUP',
-      body: `📌 *Grup:* ${meta?.subject || 'Grup'}\n• *Keamanan:* Link(${cfg.antilink ? 'ON' : 'OFF'}) | Virtek(${cfg.antivirtek ? 'ON' : 'OFF'}) | Toxic(${cfg.antitoxic ? 'ON' : 'OFF'}) | Spam(${cfg.antispam ? 'ON' : 'OFF'})\n• *👑 VVIP Admin:* AKTIF\n• *Mode Interaksi:* ${cfg.interactiveMode.toUpperCase()} (${cur.isLiveSession ? 'Sesi Live 🟢' : 'Standby'})\n• *Welcome / Goodbye:* ${cfg.welcome ? 'ON' : 'OFF'} / ${cfg.goodbye ? 'ON' : 'OFF'}\n• *Auto Buka / Tutup:* ${cfg.autoOpenTime || '-'} / ${cfg.autoCloseTime || '-'}\n• *Auto ACC Member:* ${cfg.memberFilter.enabled ? 'ON ✅' : 'OFF ❌'}\n• *Kegiatan Terjadwal:* ${cfg.activities.length} jadwal`,
+      body: `📌 *Grup:* ${meta?.subject || 'Grup'}\n• *Keamanan:* Link(${cfg.antilink ? 'ON' : 'OFF'}) | Virtek(${cfg.antivirtek ? 'ON' : 'OFF'}) | Toxic(${cfg.antitoxic ? 'ON' : 'OFF'}) | Spam(${cfg.antispam ? 'ON' : 'OFF'}) | TagStatus(${cfg.antitagstatus ? 'ON' : 'OFF'})\n• *👑 VVIP Admin:* AKTIF\n• *Mode Interaksi:* ${cfg.interactiveMode.toUpperCase()} (${cur.isLiveSession ? 'Sesi Live 🟢' : 'Standby'})\n• *Welcome / Goodbye:* ${cfg.welcome ? 'ON' : 'OFF'} / ${cfg.goodbye ? 'ON' : 'OFF'}\n• *Auto Buka / Tutup:* ${cfg.autoOpenTime || '-'} / ${cfg.autoCloseTime || '-'}\n• *Auto ACC Member:* ${cfg.memberFilter.enabled ? 'ON ✅' : 'OFF ❌'}\n• *Kegiatan Terjadwal:* ${cfg.activities.length} jadwal`,
       footer: 'Ketik .keamanangrup untuk daftar perintah keamanan',
       buttons: [
         { text: '🛡️ Menu Keamanan', id: 'keamanangrup' },
@@ -909,10 +993,27 @@ async function runGroupCommand({ sock, jid, isGroup, senderParticipant, senderNu
     return true;
   }
 
+  if (cmd === 'jadwal') {
+    const [sub, ...rest] = param.split(/\s+/);
+    const alias = { '': 'listkegiatan', hapus: 'hapuskegiatan', tes: 'teskegiatan' }[sub.toLowerCase()];
+    if (alias) {
+      cmd = alias;
+      param = rest.join(' ');
+    } else {
+      const act = parseJadwal(param);
+      if (!act) { await reply(JADWAL_USAGE); return true; }
+      cfg.activities.push(act);
+      await save();
+      const label = act.repeat === 'jam' ? `Tiap jam menit :${act.time.slice(3)}` : `${act.repeat ? `${act.repeat.toUpperCase()} ${act.date || act.day.toUpperCase()}` : 'HARIAN'} ${act.time} WIB`;
+      await reply(`✅ Jadwal ditambahkan\n🔁 *${label}*\n💬 ${act.content.slice(0, 80)}`);
+      return true;
+    }
+  }
+
   if (cmd === 'tambahkegiatan') {
     const segs = param.split('|').map((s) => s.trim());
     if (segs.length < 3 || !segs[2]) {
-      await reply('⚠️ Format: `tambahkegiatan [hari] <HH:mm> | <materi/poll/jadwal> | <isi>`\nContoh: `tambahkegiatan senin 19:00 | materi | ai:Python Dasar`\nPoll: `tambahkegiatan 20:00 | poll | Pertanyaan ; Opsi 1 ; Opsi 2`');
+      await reply('⚠️ Format: `tambahkegiatan [hari] <HH:mm> | <materi/poll/jadwal> | <isi>`\nContoh: `tambahkegiatan senin 19:00 | materi | ai:Python Dasar`\nPoll: `tambahkegiatan 20:00 | poll | Pertanyaan ; Opsi 1 ; Opsi 2`\n\nPengingat teks biasa: `jadwal 07:00 Selamat pagi`');
       return true;
     }
     const tokens = segs[0].toLowerCase().replace(/\bwib\b/g, '').trim().split(/\s+/).filter(Boolean);
@@ -937,8 +1038,8 @@ async function runGroupCommand({ sock, jid, isGroup, senderParticipant, senderNu
 
   if (cmd === 'listkegiatan') {
     await reply(cfg.activities.length
-      ? `🗓️ *KEGIATAN GRUP*\n\n${cfg.activities.map((a, i) => `*${i + 1}.* [${(normalizeDay(a.day) || 'setiap_hari').toUpperCase()} • ${normalizeTime(a.time) || a.time} WIB] *(${String(a.type || 'jadwal').toUpperCase()})*\n    ${String(a.content || '').slice(0, 80)}`).join('\n\n')}`
-      : '📭 Belum ada jadwal kegiatan.');
+      ? `🗓️ *KEGIATAN GRUP*\n\n${cfg.activities.map((a, i) => `*${i + 1}.* [${a.date || (normalizeDay(a.day) || 'setiap_hari').toUpperCase()}${a.repeat ? ` 🔁${a.repeat.toUpperCase()}` : ''} • ${a.repeat === 'jam' ? `:${normalizeTime(a.time).slice(3)}` : `${normalizeTime(a.time) || a.time} WIB`}] *(${String(a.type || 'jadwal').toUpperCase()})*\n    ${String(a.content || '').slice(0, 80)}`).join('\n\n')}\n\n_.jadwal hapus <no> • .jadwal tes <no>_`
+      : `📭 Belum ada jadwal.\n\n${JADWAL_USAGE}`);
     return true;
   }
 
@@ -950,10 +1051,10 @@ async function runGroupCommand({ sock, jid, isGroup, senderParticipant, senderNu
       return true;
     }
     const idx = parseInt(param, 10) - 1;
-    if (Number.isNaN(idx) || idx < 0 || idx >= cfg.activities.length) { await reply('⚠️ Masukkan nomor kegiatan yang valid (lihat `listkegiatan`) atau `hapuskegiatan semua`.'); return true; }
+    if (Number.isNaN(idx) || idx < 0 || idx >= cfg.activities.length) { await reply('⚠️ Masukkan nomor yang valid (lihat `jadwal`) atau `jadwal hapus semua`.'); return true; }
     const removed = cfg.activities.splice(idx, 1)[0];
     await save();
-    await reply(`🗑️ Kegiatan *[${removed.time} WIB]* dihapus.`);
+    await reply(`🗑️ Jadwal *[${removed.time} WIB]* dihapus.`);
     return true;
   }
 
@@ -971,7 +1072,7 @@ async function runGroupCommand({ sock, jid, isGroup, senderParticipant, senderNu
       return true;
     }
     const idx = parseInt(param, 10) - 1;
-    if (Number.isNaN(idx) || idx < 0 || idx >= cfg.activities.length) { await reply('⚠️ Contoh: `teskegiatan 1` atau `teskegiatan semua`'); return true; }
+    if (Number.isNaN(idx) || idx < 0 || idx >= cfg.activities.length) { await reply('⚠️ Contoh: `jadwal tes 1` atau `jadwal tes semua`'); return true; }
     await executeGroupActivity(sock, jid, cfg.activities[idx], dbMemory, saveMemory);
     return true;
   }
