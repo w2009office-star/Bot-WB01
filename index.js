@@ -2,13 +2,13 @@ import fs from 'fs';
 import fsPromises from 'fs/promises';
 import os from 'os';
 import path from 'path';
-import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadContentFromMessage } from '@whiskeysockets/baileys';
+import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
 import pino from 'pino';
 
 import { mulaiWeb } from './web.js';
 import { restoreAuthFromGitHub, scheduleAuthBackupToGitHub, startGitHubLiveHotReload, setupGracefulShutdown } from './github_sync.js';
 import { ALL_GROUP_COMMANDS, GROUP_AUTO_ONLY_COMMANDS, GROUP_SECURITY_MENU, isSenderGroupAdmin, handleGroupMessageGuard, handleGroupCommand, handleGroupParticipantsUpdate, handleGroupJoinRequestEvent, startGroupAutomationScheduler, handleGroupThemeInteraction } from './group_automation.js';
-import { PREMIUM_COMMANDS, ensureUserRecord, checkAndConsumeDailyLimit, handlePremiumCommand, startPremiumAndQrisWatcher } from './premium_limit.js';
+import { PREMIUM_COMMANDS, ensureUserRecord, checkAndConsumeDailyLimit, handlePremiumCommand, startPremiumAndQrisWatcher, handlePremiumProofText } from './premium_limit.js';
 import { DOWNLOAD_COMMANDS, DOWNLOAD_MENU, handleDownloadCommand, handleDirectUrlAutoDownload, fetchWithTimeout, fetchBuffer, extractUrl, mediaBufferToWebpSticker, createBratSticker, urlOrTextToWebpSticker, extractAndDownloadViewOnce, sendNativeInteractiveButtons, panggilServerAISatSet, getAnimeImageUrl } from './engines.js';
 
 const PHONE = (process.env.PHONE_NUMBER || '').replace(/\D/g, '');
@@ -20,13 +20,13 @@ const MENU_BANNER_LINK = process.env.MENU_BANNER_LINK || '';
 const bot = {
   sock: null, connected: false, registered: false, qr: null, pairingCode: null,
   startTime: Date.now(), userPhone: null, userName: 'WHUXEN BOT',
-  stats: { totalDeletedBadWords: 0, totalDeletedLinks: 0, totalBlockedVirtek: 0, lastCleanupTime: new Date().toLocaleString('id-ID') },
+  stats: { totalDeletedBadWords: 0, totalDeletedLinks: 0, totalBlockedVirtek: 0, totalDeletedTagStatus: 0, lastCleanupTime: new Date().toLocaleString('id-ID') },
   badWords: ['anjing', 'babi', 'kunyuk', 'bajingan', 'goblok', 'tolol', 'bangsat', 'brengsek', 'jancok', 'pantek'],
   blockedDomains: ['judionline', 'slotgacor', 'situs-terlarang.com', 'link-spam.xyz'],
 };
 
 let dbMemory = {
-  version: 9.9, lastUpdateDate: '', updateLogs: [], users: {}, pendingInvoices: [],
+  version: 10.0, lastUpdateDate: '', updateLogs: [], users: {}, pendingInvoices: [],
   learnedWords: [], notes: {}, groupSettings: {}, gameHighScores: { kuroslash: {}, sonic: {} },
   botSettings: { mode: 'public', autoread: false, autotyping: true, customBotName: '' },
   healthReport: { lastChecked: '-', summary: 'Modular Group Security + Multi-Engine Downloader', details: {}, autoRepairs: [], totalRepairs: 0 },
@@ -53,7 +53,7 @@ const ALL_COMMANDS_SET = new Set([
 const formatCategoryBox = (title, list) =>
   `*╭┈───〔 ${title} 〕┈───⊷*\n${list.map((c) => `*├✦* .${c}`).join('\n')}\n*╰───────────────────⊷*`;
 
-const serverAutoHeal = { totalAutoRepairs: 0, validCount: ALL_COMMANDS_SET.size, isUpdating: false, updateProgressText: '' };
+const serverAutoHeal = { totalAutoRepairs: 0 };
 
 function recordAutoRepair(mod, err, fix) {
   serverAutoHeal.totalAutoRepairs++;
@@ -172,13 +172,11 @@ function getServerHardwareStats() {
 async function jalankanEvolusiMandiri(paksaManual = false) {
   const hariIni = getTodayDateString();
   if (!paksaManual && dbMemory.lastUpdateDate === hariIni) return false;
-  serverAutoHeal.isUpdating = true;
   dbMemory.version = Number((dbMemory.version + 0.1).toFixed(1));
   dbMemory.lastUpdateDate = hariIni;
-  const log = `v${dbMemory.version} (${hariIni}): Multi-Engine Downloader (yt-dlp + Race API) & Group Security.`;
+  const log = `v${dbMemory.version} (${hariIni}): Multi-Engine Downloader + Group Security + VVIP Protection.`;
   dbMemory.updateLogs.unshift(log);
   await saveMemory();
-  serverAutoHeal.isUpdating = false;
   return log;
 }
 
@@ -307,15 +305,6 @@ function safeEvaluateMath(expr) {
   return i === s.length && res !== null && Number.isFinite(res) ? Number(res.toFixed(6)) : null;
 }
 
-async function mintaKodePairing(sock, phone) {
-  try {
-    if (!sock || !phone || bot.connected || sock.authState?.creds?.registered) return;
-    const code = await sock.requestPairingCode(phone);
-    bot.pairingCode = code?.match(/.{1,4}/g)?.join('-') || code;
-    console.log(`🔑 KODE OTP BOT: ${bot.pairingCode}`);
-  } catch { bot.pairingCode = 'Gagal memuat OTP'; }
-}
-
 async function getCuacaKotaAkurat(cityName) {
   const cleanCity = (cityName || 'Jakarta').trim();
   try {
@@ -362,6 +351,11 @@ async function prosesSatuPesan(sock, msg) {
 
     const isSenderAdmin = isGroup ? await isSenderGroupAdmin(sock, jid, rawParticipant, senderNum, altNum, isOwner) : isOwner;
     if (isGroup && await handleGroupMessageGuard({ sock, jid, msg, rawText, textLower, senderParticipant: rawParticipant, senderNum, isSenderAdmin, isOwner, bot, dbMemory })) return;
+
+    // Auto-deteksi teks bukti pembayaran VVIP (ID Transaksi DANA) jika bukan command
+    if (!/^[.!/#]/.test(rawText)) {
+      if (await handlePremiumProofText({ sock, jid, senderNum, text: rawText, msg, dbMemory, saveMemory })) return;
+    }
 
     const cleanAction = textLower.replace(/^[.!/#]/, '').trim();
     if (cleanAction === 'stopgame' && gameSessions.has(jid)) { gameSessions.delete(jid); await sock.sendMessage(jid, { text: '🛑 Permainan dihentikan.' }, { quoted: msg }); return; }
@@ -433,7 +427,6 @@ async function prosesSatuPesan(sock, msg) {
     const cmd = args[0].toLowerCase();
     const param = args.slice(1).join(' ').trim();
 
-    // Auto-download tautan langsung (TikTok, CapCut, YouTube, IG, FB, Twitter/X, MediaFire, GDrive)
     if (!ALL_COMMANDS_SET.has(cmd)) {
       const directUrl = extractUrl(rawText);
       if (directUrl) {
@@ -459,20 +452,19 @@ async function prosesSatuPesan(sock, msg) {
         return;
       }
 
-      // MENU UTAMA
       if (cmd === 'menu' || cmd === 'help') {
         const dt = getIndonesianFullDateTime();
         const userRec = ensureUserRecord(dbMemory, senderNum);
         const isPrem = isOwner || isSenderAdmin || userRec.premiumUntil > Date.now();
-        const limitLabel = isPrem ? '∞ Unlimited' : `${Math.max(0, 15 - userRec.dailyUsed)}/15 tersisa`;
-        const bannerImg = MENU_BANNER_LINK || `https://dummyimage.com/1000x460/1e1035/c084fc.png&text=${encodeURIComponent(bot.userName + ' • MODULAR BOT')}`;
+        const limitLabel = isPrem ? '∞ Unlimited VVIP' : `${Math.max(0, 15 - userRec.dailyUsed)}/15 tersisa`;
+        const bannerImg = MENU_BANNER_LINK || `https://dummyimage.com/1000x460/1e1035/c084fc.png&text=${encodeURIComponent(bot.userName + ' • VVIP BOT')}`;
 
         const menuBody =
           `└ *${bot.userName}* ┐\n` +
           `🗓️ ${dt.full}\n\n` +
           `👤 *INFORMATION*\n` +
           `• *NAMA*       : ${pushName}\n` +
-          `• *STATUS*    : ${isOwner ? '👑 Owner' : isSenderAdmin ? '🛡️ Admin Grup' : userRec.premiumUntil > Date.now() ? '💎 Premium' : '⭐ Reguler'}\n` +
+          `• *STATUS*    : ${isOwner ? '👑 Owner' : isSenderAdmin ? '🛡️ Admin Grup' : userRec.premiumUntil > Date.now() ? '💎 VVIP Member' : '⭐ Reguler'}\n` +
           `• *LIMIT*        : ${limitLabel}\n` +
           `• *LOKASI*     : ${userRec.city || 'Belum diset — ketik: lokasi di bandung'}\n` +
           `• *VERSION* : v${dbMemory.version}`;
@@ -482,16 +474,16 @@ async function prosesSatuPesan(sock, msg) {
         await sendNativeInteractiveButtons(sock, jid, {
           title: 'HOME  •  ABOUT  •  PROFILE',
           body: menuBody,
-          footer: 'Ketik qris untuk Premium Unlimited 1 Minggu',
+          footer: 'Ketik qris untuk Upgrade VVIP Unlimited DANA',
           imageUrl: bannerImg,
           forwardedCard: true,
           listTitle: '📂 Pilih Kategori Fitur',
           sections: [
             {
-              title: '💎 LIMIT, QRIS & GRUP',
+              title: '💎 VVIP, QRIS & GRUP',
               rows: [
-                { title: '📊 Cek Sisa Limit Harian', description: 'Lihat sisa kuota harian atau masa aktif Premium', id: 'limit' },
-                { title: '💳 Beli Premium QRIS 1 Minggu', description: 'Aktivasi otomatis Unlimited selama 7 hari', id: 'qris' },
+                { title: '📊 Cek Sisa Limit & VVIP', description: 'Lihat sisa kuota atau masa aktif VVIP Anda', id: 'limit' },
+                { title: '💳 Upgrade VVIP (QRIS DANA)', description: 'Pilih paket VVIP otomatis (Rp1rb - Rp10rb)', id: 'qris' },
                 { title: '📥 Menu Download', description: 'TikTok, YouTube, Spotify, IG, FB & File', id: 'downloadmenu' },
                 { title: '🛡️ Menu Keamanan Grup', description: 'Anti-Link, Auto ACC, Kick, Mute & Filter Member', id: 'keamanangrup' },
                 { title: '⚙️ Panel Otomatisasi Grup', description: 'Jadwal kegiatan, Welcome & Auto Buka/Tutup', id: 'panelgrup' },
@@ -530,7 +522,6 @@ async function prosesSatuPesan(sock, msg) {
       const subMenus = { aimenu: 'AI', searchmenu: 'SEARCH', animemenu: 'ANIME', funmenu: 'FUN', logomenu: 'STICKER_LOGO', toolsmenu: 'TOOLS', ownermenu: 'OWNER' };
       if (subMenus[cmd]) { await sock.sendMessage(jid, { text: formatCategoryBox(subMenus[cmd], MENU_CATEGORIES[subMenus[cmd]]) }, { quoted: msg }); return; }
 
-      // Sistem & Status
       if (['selftest', 'cekfitur', 'autorepair'].includes(cmd)) {
         if (!isOwner && !isSenderAdmin) { await sock.sendMessage(jid, { text: '⛔ Perintah ini khusus Owner atau Admin Grup.' }, { quoted: msg }); return; }
         await sock.sendMessage(jid, { text: '🔄 *Sedang menjalankan Auto-Repair & Reset Sesi Enkripsi...*' }, { quoted: msg });
@@ -554,7 +545,6 @@ async function prosesSatuPesan(sock, msg) {
         return;
       }
 
-      // AI
       if (cmd === 'memori') { const f = dbMemory.users[senderNum]?.facts || []; await sock.sendMessage(jid, { text: f.length ? `🧠 *Ingatan:*\n• ${f.join('\n• ')}` : '🧠 Memori kosong.' }, { quoted: msg }); return; }
       if (cmd === 'resetmemori') { if (dbMemory.users[senderNum]) dbMemory.users[senderNum].facts = []; await saveMemory(); await sock.sendMessage(jid, { text: '✅ Memori direset.' }, { quoted: msg }); return; }
       if (MENU_CATEGORIES.AI.includes(cmd)) {
@@ -563,7 +553,6 @@ async function prosesSatuPesan(sock, msg) {
         return;
       }
 
-      // Search, Cuaca & Islami
       if (cmd === 'setlokasi' || cmd === 'lokasi') {
         if (!param) {
           const curCity = ensureUserRecord(dbMemory, senderNum).city;
@@ -597,7 +586,6 @@ async function prosesSatuPesan(sock, msg) {
       if (cmd === 'npm' && param) { const d = await (await fetchWithTimeout(`https://registry.npmjs.org/${encodeURIComponent(param)}`).catch(() => ({ json: () => null }))).json(); await sock.sendMessage(jid, { text: d?.name ? `📦 *${d.name}* v${d['dist-tags']?.latest}\n${d.description || ''}` : '❌ Tidak ditemukan.' }, { quoted: msg }); return; }
       if (['define', 'fakta', 'motivasi', 'kbbi'].includes(cmd)) { await sock.sendMessage(jid, { text: (await panggilServerAISatSet(`Berikan ${cmd} untuk "${param || 'Indonesia'}" secara singkat dalam Bahasa Indonesia.`, 'Jawab akurat dan ringkas.')) || '❌ Data tidak tersedia.' }, { quoted: msg }); return; }
 
-      // Anime, Fun & Game
       if (MENU_CATEGORIES.ANIME.includes(cmd)) { const u = await getAnimeImageUrl(cmd); if (u) await sock.sendMessage(jid, { image: { url: u }, caption: `✨ *${cmd.toUpperCase()}*` }, { quoted: msg }); return; }
       if (cmd === 'kuroslash' || cmd === 'slash') { const st = { type: 'kuroslash', lane: 1, hp: 100, score: 0, best: dbMemory.gameHighScores.kuroslash[senderNum] || 0, ulti: 35, wave: 0 }; gameSessions.set(jid, st); await kirimTampilanKuroSlash(sock, jid, senderNum, st, 'Tekan tombol di bawah untuk bermain!', msg); return; }
       if (cmd === 'sonic' || cmd === 'speedydash') { const st = { type: 'sonic', rings: 10, score: 0, best: dbMemory.gameHighScores.sonic[senderNum] || 0, laserAlert: false }; gameSessions.set(jid, st); await kirimTampilanSonic(sock, jid, senderNum, st, 'Tekan BOOST atau JUMP di bawah!', msg); return; }
@@ -612,7 +600,6 @@ async function prosesSatuPesan(sock, msg) {
       if (['roast', 'compliment', 'pickup', 'quote', 'joke', 'truth', 'dare', 'wyr', 'horoscope'].includes(cmd)) { await sock.sendMessage(jid, { text: (await panggilServerAISatSet(`Buat 1 ${cmd} singkat dan sopan dalam Bahasa Indonesia untuk ${param || pushName}.`, 'Jawab singkat.')) || '✨ Semangat hari ini!' }, { quoted: msg }); return; }
       if (['hug', 'pat', 'wave', 'dance'].includes(cmd)) { const u = await getAnimeImageUrl(cmd); if (u) await sock.sendMessage(jid, { image: { url: u }, caption: `*${pushName}* melakukan *${cmd}*` }, { quoted: msg }); return; }
 
-      // Sticker, Brat & Logo
       if (['sticker', 'stiker', 's'].includes(cmd)) {
         const qMsg = unwrapMessageContent(unwrapped.extendedTextMessage?.contextInfo?.quotedMessage);
         const media = unwrapped.imageMessage || qMsg?.imageMessage || unwrapped.videoMessage || qMsg?.videoMessage;
@@ -635,7 +622,6 @@ async function prosesSatuPesan(sock, msg) {
       const logoColors = { logo: '0f172a/38bdf8', neon: '090d16/00ffcc', gold: '1c1917/facc15', galaxy: '1e1b4b/c084fc', glitch: '18181b/f43f5e', matrix: '022c22/4ade80', graffiti: '312e81/fb923c', thunder: '0c4a6e/fde047' };
       if (logoColors[cmd] && param) { await sock.sendMessage(jid, { image: { url: `https://dummyimage.com/800x400/${logoColors[cmd]}.png&text=${encodeURIComponent(param)}` } }, { quoted: msg }); return; }
 
-      // Tools & RVO
       if (['rvo', 'rvop', 'vv'].includes(cmd)) {
         const vo = await extractAndDownloadViewOnce(unwrapped.extendedTextMessage?.contextInfo?.quotedMessage);
         if (!vo?.buffer) { await sock.sendMessage(jid, { text: '⚠️ Balas pesan View Once dengan `.rvo`' }, { quoted: msg }); return; }
@@ -658,7 +644,6 @@ async function prosesSatuPesan(sock, msg) {
       if (cmd === 'reverse' && param) { await sock.sendMessage(jid, { text: param.split('').reverse().join('') }, { quoted: msg }); return; }
       if (cmd === 'ssweb' && extractUrl(param)) { await sock.sendMessage(jid, { image: { url: `https://api.microlink.io/?url=${encodeURIComponent(extractUrl(param))}&screenshot=true&meta=false&embed=screenshot.url` } }, { quoted: msg }); return; }
 
-      // Owner
       if (MENU_CATEGORIES.OWNER.includes(cmd)) {
         if (!isOwner) { await sock.sendMessage(jid, { text: '⛔ Perintah ini khusus Owner Bot.' }, { quoted: msg }); return; }
         if (['setnama', 'setname', 'botname'].includes(cmd) && param) { bot.userName = dbMemory.botSettings.customBotName = param; await saveMemory(); await sock.updateProfileName(param).catch(() => {}); await sock.sendMessage(jid, { text: `✅ Nama bot: *${param}*` }, { quoted: msg }); }
@@ -711,7 +696,6 @@ async function start() {
     setInterval(() => jalankanAuditFiturRealTime(false), 5 * 60 * 1000);
     setupGracefulShutdown(bot, saveMemory);
     startGitHubLiveHotReload(async (commitId) => {
-      serverAutoHeal.updateProgressText = `✅ Live Update GitHub — ${commitId} — berhasil tanpa putus WA`;
       await jalankanAuditFiturRealTime(true);
     });
   }
@@ -721,7 +705,7 @@ async function start() {
   console.log(`\n🤖 ${bot.userName} v${dbMemory.version} — ${ALL_COMMANDS_SET.size} FITUR AKTIF\n`);
 
   const sock = makeWASocket({
-    version, auth: state, logger: pino({ level: 'silent' }), browser: ['WHUXEN Bot', 'Chrome', '9.9.0'],
+    version, auth: state, logger: pino({ level: 'silent' }), browser: ['WHUXEN Bot', 'Chrome', '10.0.0'],
     printQRInTerminal: false, getMessage: async (key) => sentMessageCache.get(key.id) || { conversation: '' },
   });
 
@@ -764,7 +748,12 @@ async function start() {
   sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
     if (qr && !bot.connected) {
       bot.qr = qr;
-      if (PHONE && !bot.registered && !bot.pairingCode) setTimeout(() => mintaKodePairing(sock, PHONE), 2000);
+      if (PHONE && !bot.registered && !bot.pairingCode) setTimeout(() => {
+        sock.requestPairingCode(PHONE).then((c) => {
+          bot.pairingCode = c?.match(/.{1,4}/g)?.join('-') || c;
+          console.log(`🔑 KODE OTP BOT: ${bot.pairingCode}`);
+        }).catch(() => {});
+      }, 2000);
     }
     if (connection === 'open') {
       bot.connected = true; bot.registered = true; bot.qr = null; bot.pairingCode = null;
@@ -792,7 +781,7 @@ mulaiWeb({
   getFeatureCount: () => ALL_COMMANDS_SET.size,
   requestNewPairingCode: () => {
     bot.pairingCode = null;
-    return mintaKodePairing(bot.sock, PHONE);
+    return bot.sock?.requestPairingCode(PHONE).then((c) => { bot.pairingCode = c?.match(/.{1,4}/g)?.join('-') || c; }).catch(() => {});
   },
 });
 start();
