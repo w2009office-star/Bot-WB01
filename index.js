@@ -2,20 +2,22 @@ import fs from 'fs';
 import fsPromises from 'fs/promises';
 import os from 'os';
 import path from 'path';
-import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
+import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadContentFromMessage } from '@whiskeysockets/baileys';
 import pino from 'pino';
 
 import { mulaiWeb } from './web.js';
 import { restoreAuthFromGitHub, scheduleAuthBackupToGitHub, startGitHubLiveHotReload, setupGracefulShutdown } from './github_sync.js';
 import { ALL_GROUP_COMMANDS, GROUP_AUTO_ONLY_COMMANDS, GROUP_SECURITY_MENU, isSenderGroupAdmin, handleGroupMessageGuard, handleGroupCommand, handleGroupParticipantsUpdate, handleGroupJoinRequestEvent, startGroupAutomationScheduler, handleGroupThemeInteraction } from './group_automation.js';
-import { PREMIUM_COMMANDS, ensureUserRecord, checkAndConsumeDailyLimit, handlePremiumCommand, startPremiumAndQrisWatcher, handlePremiumProofText } from './premium_limit.js';
+import { PREMIUM_COMMANDS, PREMIUM_PACKAGES, LIMIT_EXEMPT_COMMANDS, ensureUserRecord, isUserPremium, formatRemainingTime, checkAndConsumeDailyLimit, handlePremiumCommand, startPremiumAndQrisWatcher, handlePremiumProofText } from './premium_limit.js';
 import { DOWNLOAD_COMMANDS, DOWNLOAD_MENU, handleDownloadCommand, handleDirectUrlAutoDownload, fetchWithTimeout, fetchBuffer, extractUrl, mediaBufferToWebpSticker, createBratSticker, urlOrTextToWebpSticker, extractAndDownloadViewOnce, sendNativeInteractiveButtons, panggilServerAISatSet, getAnimeImageUrl } from './engines.js';
+
+/* ═════════════════════════ KONFIGURASI & STATE ═════════════════════════ */
 
 const PHONE = (process.env.PHONE_NUMBER || '').replace(/\D/g, '');
 const AUTH_DIR = process.env.AUTH_DIR || './auth';
 const MEMORY_FILE = './memory.json';
 const OWNER_NAME = process.env.OWNER_NAME || 'Maverick';
-const MENU_BANNER_LINK = process.env.MENU_BANNER_LINK || '';
+const DAILY_LIMIT = 15; // samakan dengan DAILY_FREE_LIMIT di premium_limit.js
 
 const bot = {
   sock: null, connected: false, registered: false, qr: null, pairingCode: null,
@@ -32,6 +34,14 @@ let dbMemory = {
   healthReport: { lastChecked: '-', summary: 'Modular Group Security + Multi-Engine Downloader', details: {}, autoRepairs: [], totalRepairs: 0 },
 };
 
+const gameSessions = new Map();
+const sentMessageCache = new Map();
+const lastReplyTextByJid = new Map();
+const retryCooldownByJid = new Map();
+const serverAutoHeal = { totalAutoRepairs: 0 };
+
+/* ═════════════════════════ DAFTAR FITUR & MENU ═════════════════════════ */
+
 const MENU_CATEGORIES = {
   AI: ['ai', 'gpt', 'ask', 'tanya', 'gemini', 'chatgpt', 'simi', 'cerita', 'puisi', 'pantun', 'kode', 'coding', 'ringkas', 'memori', 'resetmemori'],
   SEARCH: ['cuaca', 'wthr', 'setlokasi', 'lokasi', 'praytime', 'surah', 'wiki', 'npm', 'define', 'fakta', 'motivasi', 'kbbi'],
@@ -43,17 +53,78 @@ const MENU_CATEGORIES = {
   SYSTEM: ['menu', 'help', 'allmenu', 'groupmenu', 'aimenu', 'downloadmenu', 'dlmenu', 'searchmenu', 'animemenu', 'funmenu', 'logomenu', 'toolsmenu', 'ownermenu', 'ping', 'ping2', 'speed', 'os', 'alive', 'runtime', 'uptime', 'owner', 'status', 'selftest', 'cekfitur', 'autorepair', 'update'],
 };
 
-const ALL_COMMANDS_SET = new Set([
-  ...Object.values(MENU_CATEGORIES).flat(),
-  ...DOWNLOAD_COMMANDS,
-  ...ALL_GROUP_COMMANDS,
-  ...PREMIUM_COMMANDS,
-]);
+// Kelompok di ALLMENU: `cmds` → 1 perintah 1 baris, `raw` → teks menu bawaan modul (juga 1 perintah 1 baris)
+const MENU_GROUPS = [
+  { id: 'vip', icon: '💎', title: 'VIP & Limit', cmds: PREMIUM_COMMANDS },
+  { id: 'download', icon: '📥', title: 'Download', raw: DOWNLOAD_MENU, desc: 'TikTok • YouTube • IG • FB • File' },
+  { id: 'security', icon: '🛡️', title: 'Keamanan Grup', raw: GROUP_SECURITY_MENU, desc: 'anti-link • ACC • kick • mute' },
+  { id: 'groupauto', icon: '⚙️', title: 'Otomatisasi Grup', cmds: GROUP_AUTO_ONLY_COMMANDS },
+  { id: 'ai', icon: '🤖', title: 'AI & Memori', cmds: MENU_CATEGORIES.AI },
+  { id: 'search', icon: '🔎', title: 'Pencarian', cmds: MENU_CATEGORIES.SEARCH },
+  { id: 'fun', icon: '🎮', title: 'Game & Hiburan', cmds: MENU_CATEGORIES.FUN },
+  { id: 'anime', icon: '🎌', title: 'Anime', cmds: MENU_CATEGORIES.ANIME },
+  { id: 'logo', icon: '🎨', title: 'Stiker & Logo', cmds: MENU_CATEGORIES.STICKER_LOGO },
+  { id: 'tools', icon: '🧰', title: 'Tools', cmds: MENU_CATEGORIES.TOOLS },
+  { id: 'owner', icon: '👑', title: 'Owner', cmds: MENU_CATEGORIES.OWNER },
+  { id: 'system', icon: '⚙️', title: 'Sistem', cmds: MENU_CATEGORIES.SYSTEM },
+];
 
-const formatCategoryBox = (title, list) =>
-  `*╭┈───〔 ${title} 〕┈───⊷*\n${list.map((c) => `*├✦* .${c}`).join('\n')}\n*╰───────────────────⊷*`;
+const SUB_MENU = { groupmenu: 'security', aimenu: 'ai', searchmenu: 'search', animemenu: 'anime', funmenu: 'fun', logomenu: 'logo', toolsmenu: 'tools', ownermenu: 'owner', downloadmenu: 'download', dlmenu: 'download' };
+['allmenu', ...Object.keys(SUB_MENU)].forEach((c) => LIMIT_EXEMPT_COMMANDS.add(c)); // navigasi menu tidak memakai limit
 
-const serverAutoHeal = { totalAutoRepairs: 0 };
+const ALL_COMMANDS_SET = new Set([...Object.values(MENU_CATEGORIES).flat(), ...DOWNLOAD_COMMANDS, ...ALL_GROUP_COMMANDS, ...PREMIUM_COMMANDS]);
+
+/* ═════════════════════════ UTIL UMUM ═════════════════════════ */
+
+const rand = (n) => Math.floor(Math.random() * n);
+const pick = (arr) => arr[rand(arr.length)];
+const rp = (n) => `Rp${n.toLocaleString('id-ID')}`;
+const askAI = (prompt, sys = 'Jawab singkat dan akurat dalam Bahasa Indonesia.') => panggilServerAISatSet(prompt, sys);
+const shot = (u) => `https://api.microlink.io/?url=${encodeURIComponent(u)}&screenshot=true&meta=false&embed=screenshot.url`;
+const getJson = async (url, ms = 10000) => { try { return await (await fetchWithTimeout(url, {}, ms)).json(); } catch { return null; } };
+const wib = (opts) => new Intl.DateTimeFormat('id-ID', { timeZone: 'Asia/Jakarta', ...opts }).format(new Date());
+const getFullDateTime = () => `${wib({ weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' })} WIB`;
+const getGreeting = () => { const h = Number(wib({ hour: '2-digit', hourCycle: 'h23' })); return h < 11 ? 'pagi' : h < 15 ? 'siang' : h < 18 ? 'sore' : 'malam'; };
+const getTodayDateString = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta' }).format(new Date());
+const saveMemory = () => fsPromises.writeFile(MEMORY_FILE, JSON.stringify(dbMemory, null, 2), 'utf-8').catch(() => {});
+const box = (title, cmds) => `╭─〔 ${title} 〕\n${cmds.map((c) => `│ • .${c}`).join('\n')}\n╰──────────────────`;
+
+function getUptime() {
+  const s = Math.floor((Date.now() - bot.startTime) / 1000);
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+  return `${d ? `${d}h ` : ''}${h}j ${m}m ${s % 60}d`;
+}
+
+function getServerHardwareStats() {
+  const ramPercent = Math.round(((os.totalmem() - os.freemem()) / os.totalmem()) * 100);
+  const bar = (pct) => '█'.repeat(Math.round(pct / 10)) + '░'.repeat(10 - Math.round(pct / 10));
+  let diskPercent = 35;
+  try { const st = fs.statfsSync('.'); diskPercent = Math.round(((st.blocks - st.bfree) / st.blocks) * 100); } catch {}
+  return { ramPercent, ramBar: bar(ramPercent), diskPercent, diskBar: bar(diskPercent) };
+}
+
+const downloadBuffer = async (media, type) => {
+  const chunks = [];
+  for await (const ch of await downloadContentFromMessage(media, type)) chunks.push(ch);
+  return Buffer.concat(chunks);
+};
+
+/* ═════════════════════════ MEMORI, AUTO-REPAIR & AUDIT ═════════════════════════ */
+
+async function loadMemory() {
+  try {
+    if (!fs.existsSync(MEMORY_FILE)) return await saveMemory();
+    const p = JSON.parse(await fsPromises.readFile(MEMORY_FILE, 'utf-8'));
+    Object.assign(dbMemory, {
+      ...dbMemory, ...p,
+      pendingInvoices: Array.isArray(p.pendingInvoices) ? p.pendingInvoices : [],
+      botSettings: { ...dbMemory.botSettings, ...(p.botSettings || {}) },
+      healthReport: { ...dbMemory.healthReport, ...(p.healthReport || {}) },
+      gameHighScores: { kuroslash: { ...(p.gameHighScores?.kuroslash || {}) }, sonic: { ...(p.gameHighScores?.sonic || {}) } },
+    });
+    if (dbMemory.botSettings.customBotName) bot.userName = dbMemory.botSettings.customBotName;
+  } catch { await saveMemory(); }
+}
 
 function recordAutoRepair(mod, err, fix) {
   serverAutoHeal.totalAutoRepairs++;
@@ -66,36 +137,15 @@ async function repairSignalSessionForJid(jid = '', reason = 'Signal Reset') {
   let deleted = 0;
   try {
     if (!fs.existsSync(AUTH_DIR)) return 0;
-    const targetDigits = String(jid).split('@')[0].split(':')[0].replace(/\D/g, '');
-    const files = await fsPromises.readdir(AUTH_DIR);
-    for (const f of files) {
-      if (f === 'creds.json') continue;
-      if (targetDigits ? f.includes(targetDigits) && f.startsWith('session-') : f.startsWith('session-')) {
-        await fsPromises.unlink(path.join(AUTH_DIR, f)).catch(() => {});
-        deleted++;
-      }
+    const digits = String(jid).split('@')[0].split(':')[0].replace(/\D/g, '');
+    for (const f of await fsPromises.readdir(AUTH_DIR)) {
+      if (f === 'creds.json' || !f.startsWith('session-') || (digits && !f.includes(digits))) continue;
+      await fsPromises.unlink(path.join(AUTH_DIR, f)).catch(() => {});
+      deleted++;
     }
-    if (deleted > 0) recordAutoRepair('SignalCipher', reason, `Reset ${deleted} sesi`);
+    if (deleted) recordAutoRepair('SignalCipher', reason, `Reset ${deleted} sesi`);
   } catch {}
   return deleted;
-}
-
-async function jalankanAuditFiturRealTime(manual = false) {
-  const rep = {
-    lastChecked: new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' }),
-    summary: `${ALL_COMMANDS_SET.size}/${ALL_COMMANDS_SET.size} Fitur VALID & Modular Aktif`,
-    details: {
-      'Group Security & Auto': `✅ ${ALL_GROUP_COMMANDS.length} Perintah Aktif`,
-      'Download Engine': `✅ ${DOWNLOAD_COMMANDS.length} Perintah Aktif`,
-      'Premium & QRIS': `✅ ${PREMIUM_COMMANDS.length} Perintah Aktif`,
-      'Auto-Repair': `${serverAutoHeal.totalAutoRepairs}x perbaikan`,
-    },
-    autoRepairs: dbMemory.healthReport.autoRepairs || [],
-    totalRepairs: serverAutoHeal.totalAutoRepairs,
-  };
-  dbMemory.healthReport = rep;
-  if (manual) await saveMemory();
-  return rep;
 }
 
 let cipherRepairLock = false;
@@ -105,68 +155,22 @@ async function triggerAutoCipherHeal(jid = '', reason = 'Bad MAC / Decryption Fa
   try { await repairSignalSessionForJid(jid, reason); } finally { setTimeout(() => { cipherRepairLock = false; }, 4000); }
 }
 
-const origConsoleError = console.error;
-console.error = (...args) => {
-  if (/Bad MAC|SessionError|No matching sessions|Invalid PreKey|decrypt/i.test(args.map((a) => a?.message || String(a)).join(' '))) {
-    triggerAutoCipherHeal('', 'Console Signal Decryption Error').catch(() => {});
-  }
-  origConsoleError.apply(console, args);
-};
-
-process.on('uncaughtException', (err) => {
-  const m = err?.message || 'Error';
-  if (/Bad MAC|SessionError|No matching sessions|Invalid PreKey/i.test(m)) triggerAutoCipherHeal('', m.slice(0, 45)).catch(() => {});
-  else recordAutoRepair('ProcessGuard', m, 'Proses tetap berjalan normal');
-});
-
-process.on('unhandledRejection', (reason) => {
-  const m = reason?.message || String(reason);
-  if (/Bad MAC|SessionError|No sessions|No matching sessions|Invalid PreKey|Timed Out/i.test(m)) triggerAutoCipherHeal('', m.slice(0, 45)).catch(() => {});
-});
-
-async function loadMemory() {
-  try {
-    if (fs.existsSync(MEMORY_FILE)) {
-      const p = JSON.parse(await fsPromises.readFile(MEMORY_FILE, 'utf-8'));
-      dbMemory = {
-        ...dbMemory, ...p,
-        pendingInvoices: Array.isArray(p.pendingInvoices) ? p.pendingInvoices : [],
-        botSettings: { ...dbMemory.botSettings, ...(p.botSettings || {}) },
-        healthReport: { ...dbMemory.healthReport, ...(p.healthReport || {}) },
-        gameHighScores: { kuroslash: { ...(p.gameHighScores?.kuroslash || {}) }, sonic: { ...(p.gameHighScores?.sonic || {}) } },
-      };
-      if (dbMemory.botSettings.customBotName) bot.userName = dbMemory.botSettings.customBotName;
-    } else {
-      await saveMemory();
-    }
-  } catch { await saveMemory(); }
-}
-
-const saveMemory = () => fsPromises.writeFile(MEMORY_FILE, JSON.stringify(dbMemory, null, 2), 'utf-8').catch(() => {});
-const getTodayDateString = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta' }).format(new Date());
-
-function getIndonesianFullDateTime() {
-  return {
-    full: new Intl.DateTimeFormat('id-ID', { timeZone: 'Asia/Jakarta', weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' }).format(new Date()) + ' WIB',
+async function jalankanAuditFiturRealTime(manual = false) {
+  const n = ALL_COMMANDS_SET.size;
+  dbMemory.healthReport = {
+    lastChecked: new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' }),
+    summary: `${n}/${n} Fitur VALID & Modular Aktif`,
+    details: {
+      'Group Security & Auto': `✅ ${ALL_GROUP_COMMANDS.length} Perintah Aktif`,
+      'Download Engine': `✅ ${DOWNLOAD_COMMANDS.length} Perintah Aktif`,
+      'Premium & QRIS': `✅ ${PREMIUM_COMMANDS.length} Perintah Aktif`,
+      'Auto-Repair': `${serverAutoHeal.totalAutoRepairs}x perbaikan`,
+    },
+    autoRepairs: dbMemory.healthReport.autoRepairs || [],
+    totalRepairs: serverAutoHeal.totalAutoRepairs,
   };
-}
-
-function getUptime() {
-  const s = Math.floor((Date.now() - bot.startTime) / 1000);
-  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
-  return `${d ? `${d}h ` : ''}${h}j ${m}m ${sec}d`;
-}
-
-function getServerHardwareStats() {
-  const total = os.totalmem(), free = os.freemem();
-  const ramPercent = Math.round(((total - free) / total) * 100);
-  const bar = (pct) => '█'.repeat(Math.round(pct / 10)) + '░'.repeat(10 - Math.round(pct / 10));
-  let diskPercent = 35;
-  try {
-    const st = fs.statfsSync('.');
-    diskPercent = Math.round(((st.blocks - st.bfree) / st.blocks) * 100);
-  } catch {}
-  return { ramPercent, ramBar: bar(ramPercent), diskPercent, diskBar: bar(diskPercent) };
+  if (manual) await saveMemory();
+  return dbMemory.healthReport;
 }
 
 async function jalankanEvolusiMandiri(paksaManual = false) {
@@ -180,63 +184,411 @@ async function jalankanEvolusiMandiri(paksaManual = false) {
   return log;
 }
 
-const FONT_MAPS = [
-  (t) => t.replace(/[A-Za-z]/g, (c) => String.fromCodePoint(c.charCodeAt(0) + (c <= 'Z' ? 119737 : 119731))),
-  (t) => t.replace(/[A-Za-z]/g, (c) => String.fromCodePoint(c.charCodeAt(0) + (c <= 'Z' ? 119789 : 119783))),
-  (t) => t.replace(/[A-Za-z]/g, (c) => String.fromCodePoint(c.charCodeAt(0) + (c <= 'Z' ? 119841 : 119835))),
-  (t) => t.replace(/[A-Za-z]/g, (c) => String.fromCodePoint(c.charCodeAt(0) + (c <= 'Z' ? 120003 : 119997))),
-  (t) => t.replace(/[A-Za-z]/g, (c) => String.fromCodePoint(c.charCodeAt(0) + (c <= 'Z' ? 120367 : 120361))),
-];
-const applyFont = (text, idx) => (FONT_MAPS[idx] ? FONT_MAPS[idx](text) : text);
+const SIGNAL_ERR = /Bad MAC|SessionError|No matching sessions|No sessions|Invalid PreKey/i;
+const origConsoleError = console.error;
+console.error = (...args) => {
+  if (/Bad MAC|SessionError|No matching sessions|Invalid PreKey|decrypt/i.test(args.map((a) => a?.message || String(a)).join(' '))) triggerAutoCipherHeal('', 'Console Signal Decryption Error').catch(() => {});
+  origConsoleError.apply(console, args);
+};
+process.on('uncaughtException', (err) => {
+  const m = err?.message || 'Error';
+  if (SIGNAL_ERR.test(m)) triggerAutoCipherHeal('', m.slice(0, 45)).catch(() => {});
+  else recordAutoRepair('ProcessGuard', m, 'Proses tetap berjalan normal');
+});
+process.on('unhandledRejection', (reason) => {
+  const m = reason?.message || String(reason);
+  if (SIGNAL_ERR.test(m) || /Timed Out/i.test(m)) triggerAutoCipherHeal('', m.slice(0, 45)).catch(() => {});
+});
 
-async function kirimTampilanKuroSlash(sock, jid, senderNum, st, eventText, quoted) {
-  const lanes = ['⬜', '⬜', '⬜'];
-  lanes[st.lane] = '🥷';
-  await sendNativeInteractiveButtons(sock, jid, {
-    title: '⚔️ KURO SLASH — DEMON HUNTER',
-    body: `👤 Pemain: @${senderNum}\n❤️ HP: ${st.hp}% | ⚡ ULTI: ${st.ulti}%\n🏆 Skor: *${st.score}* (Best: ${st.best})\n\nArena: [ ${lanes.join(' | ')} ]\n💬 _${eventText}_`,
-    buttons: [{ text: '⬅️ KIRI', id: 'kiri' }, { text: '⚔️ TEBAS', id: 'tebas' }, { text: '➡️ KANAN', id: 'kanan' }],
-  }, quoted);
-}
-
-async function kirimTampilanSonic(sock, jid, senderNum, st, eventText, quoted) {
-  await sendNativeInteractiveButtons(sock, jid, {
-    title: '🌀 SPEEDY DASH — SONIC RUN',
-    body: `👤 Pemain: @${senderNum}\n💍 Gold Rings: *${st.rings}* | 🏆 Skor: *${st.score}* (Best: ${st.best})\n${st.laserAlert ? '⚠️ *AWAS LASER DI DEPAN! TEKAN JUMP!*' : '🛣️ Lintasan aman untuk nge-boost!'}\n\n💬 _${eventText}_`,
-    buttons: [{ text: '⚡ BOOST', id: 'boost' }, { text: '⬆️ JUMP', id: 'jump' }, { text: '🛑 STOP', id: 'stopgame' }],
-  }, quoted);
-}
+/* ═════════════════════════ LAYANAN DATA (CUACA, SHOLAT, SURAH) ═════════════════════════ */
 
 async function getJadwalSholatIndonesia(city) {
-  try {
-    const search = await (await fetchWithTimeout(`https://api.myquran.com/v2/sholat/kota/cari/${encodeURIComponent(city)}`, {}, 10000)).json();
-    const kota = search?.data?.[0];
-    if (!kota) return null;
-    const d = new Date();
-    const res = await (await fetchWithTimeout(`https://api.myquran.com/v2/sholat/jadwal/${kota.id}/${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`, {}, 10000)).json();
-    const j = res?.data?.jadwal;
-    if (!j) return null;
-    return `🕌 *JADWAL SHOLAT — ${kota.lokasi}*\n📅 ${j.tanggal}\n\n• Imsak: *${j.imsak}*\n• Subuh: *${j.subuh}*\n• Dzuhur: *${j.dzuhur}*\n• Ashar: *${j.ashar}*\n• Maghrib: *${j.maghrib}*\n• Isya: *${j.isya}*`;
-  } catch { return null; }
+  const kota = (await getJson(`https://api.myquran.com/v2/sholat/kota/cari/${encodeURIComponent(city)}`))?.data?.[0];
+  if (!kota) return null;
+  const d = new Date();
+  const p2 = (n) => String(n).padStart(2, '0');
+  const j = (await getJson(`https://api.myquran.com/v2/sholat/jadwal/${kota.id}/${d.getFullYear()}/${p2(d.getMonth() + 1)}/${p2(d.getDate())}`))?.data?.jadwal;
+  if (!j) return null;
+  return `🕌 *JADWAL SHOLAT — ${kota.lokasi}*\n📅 ${j.tanggal}\n\n• Imsak: *${j.imsak}*\n• Subuh: *${j.subuh}*\n• Dzuhur: *${j.dzuhur}*\n• Ashar: *${j.ashar}*\n• Maghrib: *${j.maghrib}*\n• Isya: *${j.isya}*`;
 }
 
 async function getSurahLengkap(no) {
-  try {
-    const res = await (await fetchWithTimeout(`https://equran.id/api/v2/surat/${parseInt(no, 10) || 1}`, {}, 10000)).json();
-    const d = res?.data;
-    if (!d) return null;
-    const ayat = (d.ayat || []).slice(0, 7).map((a) => `*${a.nomorAyat}.* ${a.teksArab}\n_${a.teksIndonesia}_`).join('\n\n');
-    return {
-      text: `📖 *QS. ${d.namaLatin} (${d.nama})*\nArti: _${d.arti}_ • ${d.jumlahAyat} Ayat\n\n${ayat}${d.jumlahAyat > 7 ? '\n\n_...(menampilkan 7 ayat pertama)_' : ''}`,
-      audioUrl: d.audioFull?.['05'] || '',
-    };
-  } catch { return null; }
+  const d = (await getJson(`https://equran.id/api/v2/surat/${parseInt(no, 10) || 1}`))?.data;
+  if (!d) return null;
+  const ayat = (d.ayat || []).slice(0, 7).map((a) => `*${a.nomorAyat}.* ${a.teksArab}\n_${a.teksIndonesia}_`).join('\n\n');
+  return {
+    text: `📖 *QS. ${d.namaLatin} (${d.nama})*\nArti: _${d.arti}_ • ${d.jumlahAyat} Ayat\n\n${ayat}${d.jumlahAyat > 7 ? '\n\n_...(menampilkan 7 ayat pertama)_' : ''}`,
+    audioUrl: d.audioFull?.['05'] || '',
+  };
 }
 
-const gameSessions = new Map();
-const sentMessageCache = new Map();
-const lastReplyTextByJid = new Map();
-const retryCooldownByJid = new Map();
+const WMO = { 0: '☀️ Cerah', 1: '🌤️ Cerah Berawan', 2: '⛅ Berawan Sebagian', 3: '☁️ Mendung / Berawan', 45: '🌫️ Berkabut', 48: '🌫️ Kabut Tebal', 51: '🌦️ Gerimis Ringan', 53: '🌦️ Gerimis Sedang', 55: '🌧️ Gerimis Lebat', 61: '🌧️ Hujan Ringan', 63: '🌧️ Hujan Sedang', 65: '⛈️ Hujan Lebat', 80: '🌦️ Hujan Lokal Ringan', 81: '🌧️ Hujan Lokal Sedang', 82: '⛈️ Hujan Lokal Lebat', 95: '⛈️ Hujan Petir', 96: '⛈️ Hujan Petir & Angin' };
+
+async function getCuacaKotaAkurat(cityName) {
+  const city = (cityName || 'Jakarta').trim();
+  const loc = (await getJson(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1&language=id&format=json`))?.results?.[0];
+  if (loc) {
+    const w = await getJson(`https://api.open-meteo.com/v1/forecast?latitude=${loc.latitude}&longitude=${loc.longitude}&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=Asia%2FJakarta&forecast_days=3`);
+    const cur = w?.current;
+    if (cur) {
+      const dly = w.daily || {};
+      return `🌤️ *PRAKIRAAN CUACA — ${loc.name.toUpperCase()}*\n📍 Titik Lokasi: *${[loc.name, loc.admin1, loc.country].filter(Boolean).join(', ')}*\n\n• Kondisi: *${WMO[cur.weather_code] || '🌤️ Berawan'}*\n• Suhu Saat Ini: *${cur.temperature_2m}°C* — Terasa *${cur.apparent_temperature}°C*\n• Suhu Hari Ini: *${dly.temperature_2m_min?.[0] ?? '-'}°C – ${dly.temperature_2m_max?.[0] ?? '-'}°C*\n• Kelembapan: *${cur.relative_humidity_2m}%*\n• Kecepatan Angin: *${cur.wind_speed_10m} km/jam*\n• Peluang Hujan: *${dly.precipitation_probability_max?.[0] ?? '-'}%*\n\n_Ketik *"lokasi di <kota>"* untuk mengganti titik kota otomatis kamu._`;
+    }
+  }
+  const c = (await getJson(`https://wttr.in/${encodeURIComponent(city)}?format=j1`, 8000))?.current_condition?.[0];
+  return c ? `🌤️ *CUACA ${city.toUpperCase()}*\n• Suhu: *${c.temp_C}°C*\n• Kelembapan: *${c.humidity}%*\n• Angin: *${c.windspeedKmph} km/jam*` : null;
+}
+
+function safeEvaluateMath(expr) {
+  const s = expr.replace(/\s+/g, '');
+  if (!s || !/^[0-9+\-*/().]+$/.test(s)) return null;
+  let i = 0;
+  const parseExpr = () => {
+    let v = parseTerm();
+    while (v !== null && (s[i] === '+' || s[i] === '-')) { const op = s[i++]; const r = parseTerm(); v = r === null ? null : op === '+' ? v + r : v - r; }
+    return v;
+  };
+  const parseTerm = () => {
+    let v = parseFactor();
+    while (v !== null && (s[i] === '*' || s[i] === '/')) {
+      const op = s[i++]; const r = parseFactor();
+      if (r === null || (op === '/' && r === 0)) return null;
+      v = op === '*' ? v * r : v / r;
+    }
+    return v;
+  };
+  const parseFactor = () => {
+    if (s[i] === '+') { i++; return parseFactor(); }
+    if (s[i] === '-') { i++; const f = parseFactor(); return f === null ? null : -f; }
+    if (s[i] === '(') { i++; const v = parseExpr(); return s[i++] === ')' ? v : null; }
+    const start = i;
+    while (/[0-9.]/.test(s[i])) i++;
+    const n = Number(s.slice(start, i));
+    return start !== i && Number.isFinite(n) ? n : null;
+  };
+  const res = parseExpr();
+  return i === s.length && res !== null && Number.isFinite(res) ? Number(res.toFixed(6)) : null;
+}
+
+/* ═════════════════════════ TAMPILAN MENU ═════════════════════════ */
+
+function getUserInfo({ isOwner, isSenderAdmin }, rec) {
+  const vip = isUserPremium(rec);
+  const unlimited = isOwner || isSenderAdmin || vip;
+  return {
+    label: isOwner ? '👑 Owner' : isSenderAdmin ? '🛡️ Admin Grup' : vip ? '💎 VVIP Member' : '⭐ Reguler',
+    limit: unlimited ? '∞ Unlimited' : `${Math.max(0, DAILY_LIMIT - rec.dailyUsed)} / ${DAILY_LIMIT} tersisa`,
+    vip: vip ? `Aktif — sisa ${formatRemainingTime(rec.premiumUntil - Date.now())}` : 'Tidak aktif',
+  };
+}
+
+async function sendMainMenu(c) {
+  const rec = ensureUserRecord(dbMemory, c.senderNum);
+  const u = getUserInfo(c, rec);
+  const body = [
+    `🗓️ ${getFullDateTime()}`,
+    '',
+    `👋 Selamat ${getGreeting()}, *${c.pushName}*!`,
+    'Silakan pilih menu di bawah.',
+    '',
+    '╭─〔 👤 INFO USER 〕',
+    `│ Nama    : ${c.pushName}`,
+    `│ Status  : ${u.label}`,
+    `│ Limit   : ${u.limit}`,
+    `│ VVIP    : ${u.vip}`,
+    `│ Lokasi  : ${rec.city || 'Belum diset (ketik: lokasi di bandung)'}`,
+    `│ Version : v${dbMemory.version}`,
+    '╰──────────────────',
+  ].join('\n');
+  lastReplyTextByJid.set(c.jid, body);
+  await sendNativeInteractiveButtons(c.sock, c.jid, {
+    title: `🤖 ${bot.userName} • MENU UTAMA`,
+    body,
+    footer: 'Ketik .qris untuk upgrade VVIP Unlimited',
+    buttons: [{ text: '📋 ALLMENU', id: 'allmenu' }, { text: '💎 QRIS • JADI VIP', id: 'qris' }],
+  }, c.msg);
+}
+
+const sendAllMenu = (c) => sendNativeInteractiveButtons(c.sock, c.jid, {
+  title: `📋 ALLMENU • ${MENU_GROUPS.length} KELOMPOK`,
+  body: `Total fitur aktif: *${ALL_COMMANDS_SET.size}*\nOwner: ${OWNER_NAME}\n\nPilih kelompok fitur pada daftar di bawah.`,
+  footer: 'Ketik .qris untuk upgrade VVIP Unlimited',
+  listTitle: '📂 Pilih Kelompok',
+  sections: [{ title: 'Kelompok Fitur', rows: MENU_GROUPS.map((g) => ({ title: `${g.icon} ${g.title}`, description: g.desc || g.cmds.slice(0, 4).join(' • '), id: `allmenu ${g.id}` })) }],
+  buttons: [{ text: '⬅️ Menu Utama', id: 'menu' }, { text: '💎 QRIS • JADI VIP', id: 'qris' }],
+}, c.msg);
+
+async function sendGroupMenu(c, id) {
+  const g = MENU_GROUPS.find((x) => x.id === id);
+  if (!g) return sendAllMenu(c);
+  const body = g.raw || box(g.title, g.cmds);
+  if (body.length > 1000) return c.reply(`*${g.icon} ${g.title.toUpperCase()}*\n\n${body}\n\n_Ketik .allmenu untuk kembali • .qris untuk VVIP_`);
+  return sendNativeInteractiveButtons(c.sock, c.jid, {
+    title: `${g.icon} ${g.title.toUpperCase()}`,
+    body,
+    buttons: [{ text: '⬅️ Allmenu', id: 'allmenu' }, { text: '💎 QRIS • JADI VIP', id: 'qris' }],
+  }, c.msg);
+}
+
+const sendQrisMenu = (c) => {
+  const pkgs = Object.entries(PREMIUM_PACKAGES);
+  return sendNativeInteractiveButtons(c.sock, c.jid, {
+    title: '💎 QRIS • UPGRADE VIP',
+    body: `╭─〔 PAKET 〕\n${pkgs.map(([k, p]) => `│ ${k}) ${p.label} — ${rp(p.price)}`).join('\n')}\n╰──────────────────\n✅ Limit harian ∞ (Unlimited)\n\nAlur: pilih paket → bayar QRIS DANA → kirim ID transaksi → VIP aktif otomatis.`,
+    footer: 'Ketik .menu untuk kembali',
+    buttons: pkgs.map(([k, p]) => ({ text: rp(p.price), id: `qris ${k}` })),
+  }, c.msg);
+};
+
+async function handleMenuCommand(c) {
+  const { cmd, param } = c;
+  if (cmd === 'menu' || cmd === 'help') await sendMainMenu(c);
+  else if (cmd === 'allmenu') await (param ? sendGroupMenu(c, param.toLowerCase()) : sendAllMenu(c));
+  else if (SUB_MENU[cmd]) await sendGroupMenu(c, SUB_MENU[cmd]);
+  else if (['qris', 'premium', 'belipremium'].includes(cmd) && !param) await sendQrisMenu(c);
+  else return false;
+  return true;
+}
+
+/* ═════════════════════════ GAME ═════════════════════════ */
+
+const kirimTampilanKuroSlash = (sock, jid, num, st, text, quoted) => sendNativeInteractiveButtons(sock, jid, {
+  title: '⚔️ KURO SLASH — DEMON HUNTER',
+  body: `👤 Pemain: @${num}\n❤️ HP: ${st.hp}% | ⚡ ULTI: ${st.ulti}%\n🏆 Skor: *${st.score}* (Best: ${st.best})\n\nArena: [ ${['⬜', '⬜', '⬜'].map((x, i) => (i === st.lane ? '🥷' : x)).join(' | ')} ]\n💬 _${text}_`,
+  buttons: [{ text: '⬅️ KIRI', id: 'kiri' }, { text: '⚔️ TEBAS', id: 'tebas' }, { text: '➡️ KANAN', id: 'kanan' }],
+}, quoted);
+
+const kirimTampilanSonic = (sock, jid, num, st, text, quoted) => sendNativeInteractiveButtons(sock, jid, {
+  title: '🌀 SPEEDY DASH — SONIC RUN',
+  body: `👤 Pemain: @${num}\n💍 Gold Rings: *${st.rings}* | 🏆 Skor: *${st.score}* (Best: ${st.best})\n${st.laserAlert ? '⚠️ *AWAS LASER DI DEPAN! TEKAN JUMP!*' : '🛣️ Lintasan aman untuk nge-boost!'}\n\n💬 _${text}_`,
+  buttons: [{ text: '⚡ BOOST', id: 'boost' }, { text: '⬆️ JUMP', id: 'jump' }, { text: '🛑 STOP', id: 'stopgame' }],
+}, quoted);
+
+const setBest = (game, num, s) => (s.best = dbMemory.gameHighScores[game][num] = Math.max(dbMemory.gameHighScores[game][num] || 0, s.score));
+
+async function handleGameInput({ sock, jid, msg, rawText, textLower, senderNum, reply }) {
+  const s = gameSessions.get(jid);
+  if (!s) return false;
+  const act = textLower.replace(/^[.!/#]/, '').trim();
+
+  if (act === 'stopgame') { gameSessions.delete(jid); await reply('🛑 Permainan dihentikan.'); return true; }
+
+  if (s.type === 'kuroslash' && ['kiri', 'tebas', 'kanan', 'ulti'].includes(act)) {
+    s.wave = (s.wave || 0) + 1;
+    const move = (d, label) => { s.lane = Math.min(2, Math.max(0, s.lane + d)); s.score += 65; s.ulti = Math.min(100, s.ulti + 15); return `Bergerak ke jalur ${label} (+65)!`; };
+    let ev;
+    if (act === 'kiri') ev = move(-1, 'KIRI');
+    else if (act === 'kanan') ev = move(1, 'KANAN');
+    else if (act === 'tebas') { s.score += 150; s.ulti = Math.min(100, s.ulti + 25); ev = '⚔️ TEBASAN TELAK! Oni ter-PARRY (+150)!'; }
+    else if (s.ulti >= 100) { s.score += 450; s.ulti = 0; ev = '🌊 GELOMBANG ULTI TERLEPAS (+450)!'; }
+    else ev = `⚠️ ULTI baru ${s.ulti}% — tekan TEBAS untuk mengisi!`;
+    setBest('kuroslash', senderNum, s);
+    await saveMemory();
+    await kirimTampilanKuroSlash(sock, jid, senderNum, s, ev, msg);
+    return true;
+  }
+  if (s.type === 'sonic' && ['boost', 'jump'].includes(act)) {
+    const add = rand(7) + 5;
+    s.rings += add; s.score += add * 35; s.laserAlert = act === 'boost' ? Math.random() < 0.45 : false;
+    setBest('sonic', senderNum, s);
+    await saveMemory();
+    await kirimTampilanSonic(sock, jid, senderNum, s, `${act === 'boost' ? '⚡ BOOST' : '⬆️ JUMP'}! +${add} Gold Rings!`, msg);
+    return true;
+  }
+  if (s.type === 'angka' && /^[0-9]+$/.test(rawText)) {
+    const g = parseInt(rawText, 10);
+    if (g === s.answer) { gameSessions.delete(jid); await reply(`🎉 *BENAR!* Angkanya *${s.answer}*.`); }
+    else await reply(g < s.answer ? '⬆️ Terlalu KECIL!' : '⬇️ Terlalu BESAR!');
+    return true;
+  }
+  if (s.type === 'math' && /^-?[0-9]+$/.test(rawText)) {
+    gameSessions.delete(jid);
+    await reply(parseInt(rawText, 10) === s.answer ? `🎉 *TEPAT!* Jawabannya *${s.answer}*.` : `❌ Salah! Jawaban: *${s.answer}*.`);
+    return true;
+  }
+  if (s.type === 'kata' && !ALL_COMMANDS_SET.has(act)) {
+    gameSessions.delete(jid);
+    await reply(textLower === s.answer ? `🎉 *BENAR!* Jawabannya *${s.answer}*.` : `❌ Salah! Jawaban: *${s.answer}*.`);
+    return true;
+  }
+  return false;
+}
+
+/* ═════════════════════════ REGISTRI PERINTAH ═════════════════════════ */
+// on(nama|[nama], handler, { owner, admin, usage })
+
+const H = new Map();
+const on = (names, fn, opt = {}) => [].concat(names).forEach((n) => H.set(n, { fn, ...opt }));
+const needUrl = (fn) => (c) => { const u = extractUrl(c.param); return u ? fn(c, u) : c.reply(`⚠️ Contoh: \`.${c.cmd} https://...\``); };
+const userOf = (c) => ensureUserRecord(dbMemory, c.senderNum);
+const QUOTED = (c) => c.unwrapped.extendedTextMessage?.contextInfo?.quotedMessage;
+
+const FONT_MAPS = [119737, 119789, 119841, 120003, 120367].map((off) => (t) => t.replace(/[A-Za-z]/g, (ch) => String.fromCodePoint(ch.charCodeAt(0) + (ch <= 'Z' ? off : off - 6))));
+const LOGO = { logo: '0f172a/38bdf8', neon: '090d16/00ffcc', gold: '1c1917/facc15', galaxy: '1e1b4b/c084fc', glitch: '18181b/f43f5e', matrix: '022c22/4ade80', graffiti: '312e81/fb923c', thunder: '0c4a6e/fde047' };
+const RATE_CMDS = ['rate', 'aura', 'sigma', 'rizz', 'vibe', 'npc', 'maincharacter', 'delulu', 'redflag', 'greenflag', 'compatibility', 'ship'];
+const AI_PERSONA = () => `Kamu adalah ${bot.userName}. Jawab singkat, cerdas, dan akurat dalam Bahasa Indonesia.`;
+
+/* ── Sistem ── */
+on(['ping', 'ping2', 'speed', 'os'], ({ reply }) => {
+  const hw = getServerHardwareStats();
+  return reply(`⚡ *SERVER STATUS*\n• Runtime: ${getUptime()}\n• RAM: ${hw.ramPercent}% ${hw.ramBar}\n• Disk: ${hw.diskPercent}% ${hw.diskBar}\n• Jam Server: ${wib({ hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' }).replace(/:/g, '.')} WIB`);
+});
+on(['alive', 'runtime', 'uptime'], ({ reply }) => reply(`🟢 *${bot.userName}* Aktif — ${getUptime()}`));
+on('owner', ({ reply }) => reply(`👤 *Owner:* ${OWNER_NAME}`));
+on('status', ({ reply }) => reply(`📊 *STATUS*\n• Fitur Aktif: ${ALL_COMMANDS_SET.size}\n• Auto-Repair Total: ${serverAutoHeal.totalAutoRepairs}x`));
+on('update', async ({ reply }) => reply(`🧬 *UPDATE SELESAI*\n${await jalankanEvolusiMandiri(true)}`), { owner: true });
+on('fixsession', async ({ jid, reply }) => {
+  const n = await repairSignalSessionForJid(jid, 'Perintah Manual fixsession');
+  return reply(`🔐 *SIGNAL CIPHER DI-RESET!*\n• Kunci sesi dibersihkan: *${n} file*\n• Status: Enkripsi chat sudah disinkronkan ulang.`);
+}, { admin: true });
+on(['selftest', 'cekfitur', 'autorepair'], async ({ jid, reply }) => {
+  await reply('🔄 *Sedang menjalankan Auto-Repair & Reset Sesi Enkripsi...*');
+  await repairSignalSessionForJid(jid, 'Auto-Repair Triggered');
+  const rep = await jalankanAuditFiturRealTime(true);
+  return reply(`🩺 *LAPORAN AUDIT FITUR*\n🕒 ${rep.lastChecked}\n📊 *${rep.summary}*\n\n${Object.entries(rep.details).map(([k, v]) => `• *${k}:* ${v}`).join('\n')}`);
+}, { admin: true });
+
+/* ── AI & memori ── */
+on(MENU_CATEGORIES.AI, async ({ cmd, param, reply }) => reply(param ? (await askAI(param, AI_PERSONA())) || '⏳ Server AI sibuk, coba ulangi.' : `⚠️ Contoh: \`.${cmd} jelaskan cara kerja AI\``));
+on('memori', ({ senderNum, reply }) => { const f = dbMemory.users[senderNum]?.facts || []; return reply(f.length ? `🧠 *Ingatan:*\n• ${f.join('\n• ')}` : '🧠 Memori kosong.'); });
+on('resetmemori', async ({ senderNum, reply }) => { if (dbMemory.users[senderNum]) dbMemory.users[senderNum].facts = []; await saveMemory(); return reply('✅ Memori direset.'); });
+
+/* ── Pencarian ── */
+on(['setlokasi', 'lokasi'], async (c) => {
+  const user = userOf(c);
+  if (!c.param) return c.reply(user.city ? `📍 Lokasi kamu saat ini: *${user.city}*\nKetik \`.lokasi di <kota baru>\` untuk mengubah.` : '⚠️ Contoh: `.lokasi di bandung`');
+  user.city = c.param.replace(/^di\s+/i, '').trim();
+  await saveMemory();
+  return c.reply(`📍 Lokasi disimpan ke *${user.city}*.\n\n${(await getCuacaKotaAkurat(user.city)) || ''}`);
+});
+on(['cuaca', 'wthr'], async (c) => {
+  const user = userOf(c);
+  const city = c.param ? c.param.replace(/^di\s+/i, '').trim() : user.city || 'Jakarta';
+  if (c.param && !user.city) { user.city = city; await saveMemory(); }
+  return c.reply((await getCuacaKotaAkurat(city)) || '❌ Kota tidak ditemukan.');
+});
+on('praytime', async (c) => c.reply((await getJadwalSholatIndonesia(c.param || userOf(c).city || 'Jakarta')) || '❌ Jadwal tidak ditemukan.'));
+on('surah', async ({ param, reply, send }) => {
+  const s = await getSurahLengkap(param || '1');
+  if (!s) return reply('❌ Surah tidak ditemukan.');
+  await reply(s.text);
+  const b = s.audioUrl ? await fetchBuffer(s.audioUrl).catch(() => null) : null;
+  if (b) await send({ audio: b, mimetype: 'audio/mpeg' });
+});
+on('wiki', async ({ param, reply }) => {
+  const d = await getJson(`https://id.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(param)}`);
+  return reply(d?.extract ? `📚 *${d.title}*\n\n${d.extract}` : '❌ Tidak ditemukan.');
+}, { usage: 'indonesia' });
+on('npm', async ({ param, reply }) => {
+  const d = await getJson(`https://registry.npmjs.org/${encodeURIComponent(param)}`);
+  return reply(d?.name ? `📦 *${d.name}* v${d['dist-tags']?.latest}\n${d.description || ''}` : '❌ Tidak ditemukan.');
+}, { usage: 'baileys' });
+on(['define', 'fakta', 'motivasi', 'kbbi'], async ({ cmd, param, reply }) => reply((await askAI(`Berikan ${cmd} untuk "${param || 'Indonesia'}" secara singkat dalam Bahasa Indonesia.`, 'Jawab akurat dan ringkas.')) || '❌ Data tidak tersedia.'));
+
+/* ── Anime, game & hiburan ── */
+on(MENU_CATEGORIES.ANIME, async ({ cmd, reply, send }) => {
+  const u = await getAnimeImageUrl(cmd);
+  return u ? send({ image: { url: u }, caption: `✨ *${cmd.toUpperCase()}*` }) : reply('❌ Gambar tidak tersedia.');
+});
+on(['hug', 'pat', 'wave', 'dance'], async ({ cmd, pushName, reply, send }) => {
+  const u = await getAnimeImageUrl(cmd);
+  return u ? send({ image: { url: u }, caption: `*${pushName}* melakukan *${cmd}*` }) : reply('❌ Gambar tidak tersedia.');
+});
+on(['kuroslash', 'slash'], ({ sock, jid, msg, senderNum }) => {
+  const st = { type: 'kuroslash', lane: 1, hp: 100, score: 0, best: dbMemory.gameHighScores.kuroslash[senderNum] || 0, ulti: 35, wave: 0 };
+  gameSessions.set(jid, st);
+  return kirimTampilanKuroSlash(sock, jid, senderNum, st, 'Tekan tombol di bawah untuk bermain!', msg);
+});
+on(['sonic', 'speedydash'], ({ sock, jid, msg, senderNum }) => {
+  const st = { type: 'sonic', rings: 10, score: 0, best: dbMemory.gameHighScores.sonic[senderNum] || 0, laserAlert: false };
+  gameSessions.set(jid, st);
+  return kirimTampilanSonic(sock, jid, senderNum, st, 'Tekan BOOST atau JUMP di bawah!', msg);
+});
+on('game', ({ jid, reply }) => { gameSessions.set(jid, { type: 'angka', answer: rand(10) + 1 }); return reply('🎮 *Tebak Angka 1 sampai 10*\nKirim tebakanmu!'); });
+on('mathgame', ({ jid, reply }) => { const a = rand(25) + 5, b = rand(25) + 5; gameSessions.set(jid, { type: 'math', answer: a + b }); return reply(`🧮 Berapa *${a} + ${b}*?`); });
+on('tebakkata', ({ jid, reply }) => { gameSessions.set(jid, { type: 'kata', answer: 'peta' }); return reply('🧩 Punya gunung tapi tidak punya pohon, punya kota tapi tidak punya rumah. Apakah aku?'); });
+on('suit', ({ param, reply }) => { const o = ['batu', 'gunting', 'kertas'], u = param.toLowerCase(); return reply(o.includes(u) ? `✊✌️✋ Kamu: *${u}* | Bot: *${pick(o)}*` : '⚠️ Contoh: `.suit batu`'); });
+on('dice', ({ reply }) => reply(`🎲 Dadu: *${rand(6) + 1}*`));
+on('coin', ({ reply }) => reply(`🪙 Koin: *${pick(['ANGKA', 'GAMBAR'])}*`));
+on('8ball', ({ reply }) => reply(`🎱 *${pick(['Ya pasti!', 'Mungkin iya.', 'Coba lagi.', 'Tidak.'])}*`));
+on(RATE_CMDS, ({ cmd, reply }) => reply(`📊 *${cmd.toUpperCase()}:* ${rand(101)}%`));
+on(['roast', 'compliment', 'pickup', 'quote', 'joke', 'truth', 'dare', 'wyr', 'horoscope'], async ({ cmd, param, pushName, reply }) =>
+  reply((await askAI(`Buat 1 ${cmd} singkat dan sopan dalam Bahasa Indonesia untuk ${param || pushName}.`, 'Jawab singkat.')) || '✨ Semangat hari ini!'));
+
+/* ── Stiker & logo ── */
+on(['sticker', 'stiker', 's'], async (c) => {
+  const q = unwrapMessageContent(QUOTED(c));
+  const img = c.unwrapped.imageMessage || q.imageMessage;
+  const vid = c.unwrapped.videoMessage || q.videoMessage;
+  let webp = null;
+  if (img || vid) webp = await mediaBufferToWebpSticker(await downloadBuffer(img || vid, img ? 'image' : 'video'), !img);
+  else if (c.param) webp = await urlOrTextToWebpSticker(c.param);
+  return webp ? c.send({ sticker: webp }) : c.reply('⚠️ Kirim/balas gambar atau video dengan `.s`');
+});
+on(['brat', 'bratvid', 'bratvideo'], async ({ cmd, param, send }) => { const w = await createBratSticker(param || 'brat', cmd !== 'brat'); if (w) await send({ sticker: w }); });
+on(['ttp', 'attp', 'qc'], async ({ param, send }) => { const w = await urlOrTextToWebpSticker(param); if (w) await send({ sticker: w }); }, { usage: 'teks' });
+on(['animasi', 'linkvideo'], ({ param, send }) => send({ image: { url: shot(extractUrl(param) || `https://dummyimage.com/800x450/0f172a/38bdf8.png&text=${encodeURIComponent(param || 'HD')}`) }, caption: '✨ Visual HD' }));
+on(['font', 'fancy'], ({ param, reply }) => reply(FONT_MAPS.map((f, i) => `${i + 1}. ${f(param)}`).join('\n')), { usage: 'teks' });
+on(Object.keys(LOGO), ({ cmd, param, send }) => send({ image: { url: `https://dummyimage.com/800x400/${LOGO[cmd]}.png&text=${encodeURIComponent(param)}` } }), { usage: 'WHUXEN' });
+
+/* ── Tools ── */
+on(['rvo', 'rvop', 'vv'], async (c) => {
+  const vo = await extractAndDownloadViewOnce(QUOTED(c));
+  if (!vo?.buffer) return c.reply('⚠️ Balas pesan View Once dengan `.rvo`');
+  return c.sock.sendMessage(c.cmd === 'rvop' ? c.rawParticipant : c.jid, vo.type === 'audio' ? { audio: vo.buffer, mimetype: 'audio/mpeg', ptt: true } : { [vo.type]: vo.buffer, caption: `👁️ RVO\n${vo.caption}` });
+});
+on('hitung', ({ param, reply }) => { const r = safeEvaluateMath(param); return reply(r === null ? '⚠️ Format perhitungan tidak valid. Contoh: `.hitung (25 + 15) * 2`' : `🧮 *${param}* = *${r}*`); }, { usage: '(25 + 15) * 2' });
+on('catat', async ({ jid, param, reply }) => { (dbMemory.notes[jid] ||= []).push(param); await saveMemory(); return reply('📝 Tersimpan!'); }, { usage: 'beli susu' });
+on('catatan', ({ jid, reply }) => { const l = dbMemory.notes[jid] || []; return reply(l.length ? l.map((v, i) => `${i + 1}. ${v}`).join('\n') : '📭 Kosong.'); });
+on(['terjemah', 'translate'], async ({ param, reply }) => {
+  const [lang, ...rest] = param.split(/\s+/);
+  if (!rest.length) return reply('⚠️ Contoh: `.terjemah en selamat pagi`');
+  return reply((await askAI(`Terjemahkan ke ${lang}: ${rest.join(' ')}`, 'Terjemahkan saja.')) || '-');
+}, { usage: 'en selamat pagi' });
+on('id', ({ jid, reply }) => reply(`🆔 \`${jid}\``));
+on('getpp', async ({ sock, rawParticipant, reply, send }) => { const pp = await sock.profilePictureUrl(rawParticipant, 'image').catch(() => null); return pp ? send({ image: { url: pp } }) : reply('❌ Privat.'); });
+on('getbio', async ({ sock, rawParticipant, reply }) => reply(`📝 ${(await sock.fetchStatus(rawParticipant).catch(() => null))?.status || '-'}`));
+on('gpass', ({ reply }) => { const ch = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%'; return reply(`🔐 \`${Array.from({ length: 12 }, () => pick(ch)).join('')}\``); });
+on('qr', ({ param, send }) => send({ image: { url: `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(param)}` } }), { usage: 'teks' });
+on('shorturl', needUrl(async ({ reply }, u) => reply(`🔗 ${await (await fetchWithTimeout(`https://tinyurl.com/api-create.php?url=${encodeURIComponent(u)}`)).text()}`)));
+on('ssweb', needUrl(({ send }, u) => send({ image: { url: shot(u) } })));
+on('waktu', ({ reply }) => reply(`🕒 ${new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })} WIB`));
+on('base64', ({ param, reply }) => reply(Buffer.from(param).toString('base64')), { usage: 'teks' });
+on('reverse', ({ param, reply }) => reply([...param].reverse().join('')), { usage: 'teks' });
+
+/* ── Owner ── */
+on(['setnama', 'setname', 'botname'], async ({ sock, param, reply }) => {
+  bot.userName = dbMemory.botSettings.customBotName = param;
+  await saveMemory();
+  await sock.updateProfileName(param).catch(() => {});
+  return reply(`✅ Nama bot: *${param}*`);
+}, { owner: true, usage: 'Nama Bot' });
+on('updatebio', async ({ sock, param, reply }) => { await sock.updateProfileStatus(param); return reply('✅ Bio bot diperbarui.'); }, { owner: true, usage: 'bio baru' });
+on(['block', 'unblock'], async ({ sock, cmd, param, reply }) => { await sock.updateBlockStatus(`${param.replace(/\D/g, '')}@s.whatsapp.net`, cmd); return reply(`✅ Berhasil ${cmd} nomor.`); }, { owner: true, usage: '628123456789' });
+on('blocklist', async ({ sock, reply }) => reply(`🚫 Diblokir: ${(await sock.fetchBlocklist()).length}`), { owner: true });
+on(['autoread', 'autotyping'], async ({ cmd, reply }) => { dbMemory.botSettings[cmd] = !dbMemory.botSettings[cmd]; await saveMemory(); return reply(`${cmd}: ${dbMemory.botSettings[cmd]}`); }, { owner: true });
+on('mode', async ({ param, reply }) => {
+  if (!['public', 'self'].includes(param)) return reply('⚠️ Contoh: `.mode public` atau `.mode self`');
+  dbMemory.botSettings.mode = param;
+  await saveMemory();
+  return reply(`Mode: ${param}`);
+}, { owner: true });
+on('badwords', ({ reply }) => reply(`Total filter: ${bot.badWords.length + dbMemory.learnedWords.length}`), { owner: true });
+on('addkata', async ({ param, reply }) => { dbMemory.learnedWords.push(param.toLowerCase()); await saveMemory(); return reply('✅ Kata filter ditambahkan.'); }, { owner: true, usage: 'kata' });
+on('delkata', async ({ param, reply }) => { dbMemory.learnedWords = dbMemory.learnedWords.filter((w) => w !== param.toLowerCase()); await saveMemory(); return reply('✅ Kata filter dihapus.'); }, { owner: true, usage: 'kata' });
+on('clean', ({ reply }) => { if (global.gc) global.gc(); return reply('🧹 Cache dibersihkan.'); }, { owner: true });
+
+async function runCommand(c) {
+  const h = H.get(c.cmd);
+  if (!h) return false;
+  if (h.owner && !c.isOwner) await c.reply('⛔ Perintah ini khusus Owner Bot.');
+  else if (h.admin && !c.isOwner && !c.isSenderAdmin) await c.reply('⛔ Perintah ini khusus Owner atau Admin Grup.');
+  else if (h.usage && !c.param) await c.reply(`⚠️ Contoh: \`.${c.cmd} ${h.usage}\``);
+  else await h.fn(c);
+  return true;
+}
+
+/* ═════════════════════════ PEMROSES PESAN ═════════════════════════ */
 
 function rememberOutgoingMessage(keyId, messageObj) {
   if (!keyId || !messageObj) return;
@@ -271,63 +623,6 @@ function extractIncomingTextAndButton(msg) {
   ).trim();
 }
 
-function safeEvaluateMath(expr) {
-  const s = expr.replace(/\s+/g, '');
-  if (!s || !/^[0-9+\-*/().]+$/.test(s)) return null;
-  let i = 0;
-  const parseExpr = () => {
-    let v = parseTerm();
-    while (v !== null && (s[i] === '+' || s[i] === '-')) {
-      const op = s[i++]; const r = parseTerm();
-      v = r === null ? null : op === '+' ? v + r : v - r;
-    }
-    return v;
-  };
-  const parseTerm = () => {
-    let v = parseFactor();
-    while (v !== null && (s[i] === '*' || s[i] === '/')) {
-      const op = s[i++]; const r = parseFactor();
-      if (r === null || (op === '/' && r === 0)) return null;
-      v = op === '*' ? v * r : v / r;
-    }
-    return v;
-  };
-  const parseFactor = () => {
-    if (s[i] === '+') { i++; return parseFactor(); }
-    if (s[i] === '-') { i++; const f = parseFactor(); return f === null ? null : -f; }
-    if (s[i] === '(') { i++; const v = parseExpr(); return s[i++] === ')' ? v : null; }
-    const start = i;
-    while (/[0-9.]/.test(s[i])) i++;
-    const n = Number(s.slice(start, i));
-    return start !== i && Number.isFinite(n) ? n : null;
-  };
-  const res = parseExpr();
-  return i === s.length && res !== null && Number.isFinite(res) ? Number(res.toFixed(6)) : null;
-}
-
-async function getCuacaKotaAkurat(cityName) {
-  const cleanCity = (cityName || 'Jakarta').trim();
-  try {
-    const geo = await (await fetchWithTimeout(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(cleanCity)}&count=1&language=id&format=json`, {}, 10000)).json();
-    const loc = geo?.results?.[0];
-    if (loc) {
-      const w = await (await fetchWithTimeout(`https://api.open-meteo.com/v1/forecast?latitude=${loc.latitude}&longitude=${loc.longitude}&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=Asia%2FJakarta&forecast_days=3`, {}, 10000)).json();
-      const cur = w?.current;
-      if (cur) {
-        const wmo = { 0: '☀️ Cerah', 1: '🌤️ Cerah Berawan', 2: '⛅ Berawan Sebagian', 3: '☁️ Mendung / Berawan', 45: '🌫️ Berkabut', 48: '🌫️ Kabut Tebal', 51: '🌦️ Gerimis Ringan', 53: '🌦️ Gerimis Sedang', 55: '🌧️ Gerimis Lebat', 61: '🌧️ Hujan Ringan', 63: '🌧️ Hujan Sedang', 65: '⛈️ Hujan Lebat', 80: '🌦️ Hujan Lokal Ringan', 81: '🌧️ Hujan Lokal Sedang', 82: '⛈️ Hujan Lokal Lebat', 95: '⛈️ Hujan Petir', 96: '⛈️ Hujan Petir & Angin' };
-        return `🌤️ *PRAKIRAAN CUACA — ${loc.name.toUpperCase()}*\n📍 Titik Lokasi: *${[loc.name, loc.admin1, loc.country].filter(Boolean).join(', ')}*\n\n• Kondisi: *${wmo[cur.weather_code] || '🌤️ Berawan'}*\n• Suhu Saat Ini: *${cur.temperature_2m}°C* — Terasa *${cur.apparent_temperature}°C*\n• Suhu Hari Ini: *${w?.daily?.temperature_2m_min?.[0] ?? '-'}°C – ${w?.daily?.temperature_2m_max?.[0] ?? '-'}°C*\n• Kelembapan: *${cur.relative_humidity_2m}%*\n• Kecepatan Angin: *${cur.wind_speed_10m} km/jam*\n• Peluang Hujan: *${w?.daily?.precipitation_probability_max?.[0] ?? '-'}%*\n\n_Ketik *"lokasi di <kota>"* untuk mengganti titik kota otomatis kamu._`;
-      }
-    }
-  } catch {}
-  try {
-    const r = await fetchWithTimeout(`https://wttr.in/${encodeURIComponent(cleanCity)}?format=j1`, {}, 8000);
-    const d = await r.json();
-    const c = d?.current_condition?.[0];
-    if (c) return `🌤️ *CUACA ${cleanCity.toUpperCase()}*\n• Suhu: *${c.temp_C}°C*\n• Kelembapan: *${c.humidity}%*\n• Angin: *${c.windspeedKmph} km/jam*`;
-  } catch {}
-  return null;
-}
-
 async function prosesSatuPesan(sock, msg) {
   try {
     if (!msg.message || msg.key.fromMe) return;
@@ -337,9 +632,9 @@ async function prosesSatuPesan(sock, msg) {
 
     const isGroup = jid.endsWith('@g.us');
     const rawParticipant = msg.key.participant || jid;
-    const senderParticipant = msg.key.participantAlt || rawParticipant;
-    const senderNum = senderParticipant.split(':')[0].split('@')[0].replace(/\D/g, '');
-    const altNum = rawParticipant.split(':')[0].split('@')[0].replace(/\D/g, '');
+    const numOf = (j) => j.split(':')[0].split('@')[0].replace(/\D/g, '');
+    const senderNum = numOf(msg.key.participantAlt || rawParticipant);
+    const altNum = numOf(rawParticipant);
     const pushName = msg.pushName || 'Member';
     const isOwner = Boolean(PHONE && (senderNum === PHONE || altNum === PHONE));
     if (dbMemory.botSettings.mode === 'self' && !isOwner) return;
@@ -350,314 +645,60 @@ async function prosesSatuPesan(sock, msg) {
     const textLower = rawText.toLowerCase();
 
     const isSenderAdmin = isGroup ? await isSenderGroupAdmin(sock, jid, rawParticipant, senderNum, altNum, isOwner) : isOwner;
+    const reply = (text) => sock.sendMessage(jid, { text }, { quoted: msg });
+    const send = (content) => sock.sendMessage(jid, content, { quoted: msg });
+    const limit = (cmd) => checkAndConsumeDailyLimit({ sock, jid, senderNum, isOwner, isSenderAdmin, cmd, msg, dbMemory, saveMemory });
+    const c = { sock, jid, msg, isGroup, isOwner, isSenderAdmin, senderNum, rawParticipant, pushName, unwrapped, rawText, textLower, reply, send };
+
     if (isGroup && await handleGroupMessageGuard({ sock, jid, msg, rawText, textLower, senderParticipant: rawParticipant, senderNum, isSenderAdmin, isOwner, bot, dbMemory })) return;
 
-    // Auto-deteksi teks bukti pembayaran VVIP (ID Transaksi DANA) jika bukan command
-    if (!/^[.!/#]/.test(rawText)) {
-      if (await handlePremiumProofText({ sock, jid, senderNum, text: rawText, msg, dbMemory, saveMemory })) return;
-    }
+    // Bukti pembayaran VVIP (ID Transaksi DANA) tanpa perintah
+    if (!/^[.!/#]/.test(rawText) && await handlePremiumProofText({ sock, jid, senderNum, text: rawText, msg, dbMemory, saveMemory })) return;
 
-    const cleanAction = textLower.replace(/^[.!/#]/, '').trim();
-    if (cleanAction === 'stopgame' && gameSessions.has(jid)) { gameSessions.delete(jid); await sock.sendMessage(jid, { text: '🛑 Permainan dihentikan.' }, { quoted: msg }); return; }
-
-    if (gameSessions.has(jid)) {
-      const s = gameSessions.get(jid);
-      if (s.type === 'kuroslash' && ['kiri', 'tebas', 'kanan', 'ulti'].includes(cleanAction)) {
-        s.wave = (s.wave || 0) + 1;
-        let ev = '';
-        if (cleanAction === 'kiri') { s.lane = Math.max(0, s.lane - 1); s.score += 65; s.ulti = Math.min(100, s.ulti + 15); ev = 'Bergerak ke jalur KIRI (+65)!'; }
-        else if (cleanAction === 'kanan') { s.lane = Math.min(2, s.lane + 1); s.score += 65; s.ulti = Math.min(100, s.ulti + 15); ev = 'Bergerak ke jalur KANAN (+65)!'; }
-        else if (cleanAction === 'tebas') { s.score += 150; s.ulti = Math.min(100, s.ulti + 25); ev = '⚔️ TEBASAN TELAK! Oni ter-PARRY (+150)!'; }
-        else if (cleanAction === 'ulti') {
-          if (s.ulti >= 100) { s.score += 450; s.ulti = 0; ev = '🌊 GELOMBANG ULTI TERLEPAS (+450)!'; }
-          else ev = `⚠️ ULTI baru ${s.ulti}% — tekan TEBAS untuk mengisi!`;
-        }
-        s.best = dbMemory.gameHighScores.kuroslash[senderNum] = Math.max(dbMemory.gameHighScores.kuroslash[senderNum] || 0, s.score);
-        await saveMemory();
-        await kirimTampilanKuroSlash(sock, jid, senderNum, s, ev, msg);
-        return;
-      }
-      if (s.type === 'sonic' && ['boost', 'jump'].includes(cleanAction)) {
-        const addR = Math.floor(Math.random() * 7) + 5;
-        s.rings += addR; s.score += addR * 35; s.laserAlert = cleanAction === 'boost' ? Math.random() < 0.45 : false;
-        s.best = dbMemory.gameHighScores.sonic[senderNum] = Math.max(dbMemory.gameHighScores.sonic[senderNum] || 0, s.score);
-        await saveMemory();
-        await kirimTampilanSonic(sock, jid, senderNum, s, `${cleanAction === 'boost' ? '⚡ BOOST' : '⬆️ JUMP'}! +${addR} Gold Rings!`, msg);
-        return;
-      }
-      if (s.type === 'angka' && /^[0-9]+$/.test(rawText)) {
-        const g = parseInt(rawText, 10);
-        if (g === s.answer) { gameSessions.delete(jid); await sock.sendMessage(jid, { text: `🎉 *BENAR!* Angkanya *${s.answer}*.` }, { quoted: msg }); }
-        else await sock.sendMessage(jid, { text: g < s.answer ? '⬆️ Terlalu KECIL!' : '⬇️ Terlalu BESAR!' }, { quoted: msg });
-        return;
-      }
-      if (s.type === 'math' && /^-?[0-9]+$/.test(rawText)) {
-        gameSessions.delete(jid);
-        await sock.sendMessage(jid, { text: parseInt(rawText, 10) === s.answer ? `🎉 *TEPAT!* Jawabannya *${s.answer}*.` : `❌ Salah! Jawaban: *${s.answer}*.` }, { quoted: msg });
-        return;
-      }
-      if (s.type === 'kata' && !ALL_COMMANDS_SET.has(cleanAction)) {
-        gameSessions.delete(jid);
-        await sock.sendMessage(jid, { text: textLower === s.answer ? `🎉 *BENAR!* Jawabannya *${s.answer}*.` : `❌ Salah! Jawaban: *${s.answer}*.` }, { quoted: msg });
-        return;
-      }
-    }
+    if (await handleGameInput(c)) return;
 
     const locMatch = rawText.match(/^(?:lokasi(?:ku| saya)?|domisili|kota(?:ku)?)\s+(?:di\s+)?([a-zA-Z\s]{3,35})$/i);
     if (locMatch) {
       const city = locMatch[1].trim();
       ensureUserRecord(dbMemory, senderNum).city = city;
       await saveMemory();
-      await sock.sendMessage(jid, { text: `📍 Titik lokasi kamu disimpan ke *${city}*.\n\n${await getCuacaKotaAkurat(city)}` }, { quoted: msg });
+      await reply(`📍 Titik lokasi kamu disimpan ke *${city}*.\n\n${(await getCuacaKotaAkurat(city)) || ''}`);
       return;
     }
 
     const weatherMatch = rawText.match(/^(?:prakiraan\s+|perkiraan\s+)?cuaca(?:\s+(?:di|kota))?\s+([a-zA-Z\s]{3,35})$/i);
     if (weatherMatch) {
-      if (!(await checkAndConsumeDailyLimit({ sock, jid, senderNum, isOwner, isSenderAdmin, cmd: 'cuaca', msg, dbMemory, saveMemory })).allowed) return;
+      if (!(await limit('cuaca')).allowed) return;
       const city = weatherMatch[1].trim();
-      const userObj = ensureUserRecord(dbMemory, senderNum);
-      if (!userObj.city) { userObj.city = city; await saveMemory(); }
-      await sock.sendMessage(jid, { text: await getCuacaKotaAkurat(city) }, { quoted: msg });
+      const user = ensureUserRecord(dbMemory, senderNum);
+      if (!user.city) { user.city = city; await saveMemory(); }
+      await reply((await getCuacaKotaAkurat(city)) || '❌ Kota tidak ditemukan.');
       return;
     }
 
-    const cleanText = /^[.!/#]/.test(rawText) ? rawText.slice(1).trim() : rawText;
-    const args = cleanText.split(/\s+/);
+    const args = (/^[.!/#]/.test(rawText) ? rawText.slice(1).trim() : rawText).split(/\s+/);
     const cmd = args[0].toLowerCase();
     const param = args.slice(1).join(' ').trim();
+    const typing = () => { if (dbMemory.botSettings.autotyping) sock.sendPresenceUpdate('composing', jid).catch(() => {}); };
 
     if (!ALL_COMMANDS_SET.has(cmd)) {
       const directUrl = extractUrl(rawText);
       if (directUrl) {
-        const limitCheck = await checkAndConsumeDailyLimit({ sock, jid, senderNum, isOwner, isSenderAdmin, cmd: 'autodownload', msg, dbMemory, saveMemory });
-        if (!limitCheck.allowed) return;
-        if (dbMemory.botSettings.autotyping) sock.sendPresenceUpdate('composing', jid).catch(() => {});
+        if (!(await limit('autodownload')).allowed) return;
+        typing();
         if (await handleDirectUrlAutoDownload(sock, jid, directUrl, msg)) return;
       }
     }
 
     if (ALL_COMMANDS_SET.has(cmd)) {
-      if (!(await checkAndConsumeDailyLimit({ sock, jid, senderNum, isOwner, isSenderAdmin, cmd, msg, dbMemory, saveMemory })).allowed) return;
-      if (dbMemory.botSettings.autotyping) sock.sendPresenceUpdate('composing', jid).catch(() => {});
-
+      if (!(await limit(cmd)).allowed) return;
+      typing();
+      const cc = { ...c, cmd, param, args };
+      if (await handleMenuCommand(cc)) return;
       if (await handlePremiumCommand({ sock, jid, senderNum, isOwner, isSenderAdmin, cmd, param, msg, dbMemory, saveMemory })) return;
       if (await handleGroupCommand({ sock, jid, isGroup, senderParticipant: rawParticipant, senderNum, isOwner, isSenderAdmin, cmd, param, unwrapped, msg, dbMemory, saveMemory })) return;
       if (await handleDownloadCommand({ sock, jid, cmd, param, msg })) return;
-
-      if (cmd === 'fixsession') {
-        if (!isOwner && !isSenderAdmin) { await sock.sendMessage(jid, { text: '⛔ Perintah ini khusus Owner atau Admin Grup.' }, { quoted: msg }); return; }
-        const deleted = await repairSignalSessionForJid(jid, 'Perintah Manual fixsession');
-        await sock.sendMessage(jid, { text: `🔐 *SIGNAL CIPHER DI-RESET!*\n• Kunci sesi dibersihkan: *${deleted} file*\n• Status: Enkripsi chat sudah disinkronkan ulang.` }, { quoted: msg });
-        return;
-      }
-
-      if (cmd === 'menu' || cmd === 'help') {
-        const dt = getIndonesianFullDateTime();
-        const userRec = ensureUserRecord(dbMemory, senderNum);
-        const isPrem = isOwner || isSenderAdmin || userRec.premiumUntil > Date.now();
-        const limitLabel = isPrem ? '∞ Unlimited VVIP' : `${Math.max(0, 15 - userRec.dailyUsed)}/15 tersisa`;
-        const bannerImg = MENU_BANNER_LINK || `https://dummyimage.com/1000x460/1e1035/c084fc.png&text=${encodeURIComponent(bot.userName + ' • VVIP BOT')}`;
-
-        const menuBody =
-          `└ *${bot.userName}* ┐\n` +
-          `🗓️ ${dt.full}\n\n` +
-          `👤 *INFORMATION*\n` +
-          `• *NAMA*       : ${pushName}\n` +
-          `• *STATUS*    : ${isOwner ? '👑 Owner' : isSenderAdmin ? '🛡️ Admin Grup' : userRec.premiumUntil > Date.now() ? '💎 VVIP Member' : '⭐ Reguler'}\n` +
-          `• *LIMIT*        : ${limitLabel}\n` +
-          `• *LOKASI*     : ${userRec.city || 'Belum diset — ketik: lokasi di bandung'}\n` +
-          `• *VERSION* : v${dbMemory.version}`;
-
-        lastReplyTextByJid.set(jid, menuBody);
-
-        await sendNativeInteractiveButtons(sock, jid, {
-          title: 'HOME  •  ABOUT  •  PROFILE',
-          body: menuBody,
-          footer: 'Ketik qris untuk Upgrade VVIP Unlimited DANA',
-          imageUrl: bannerImg,
-          forwardedCard: true,
-          listTitle: '📂 Pilih Kategori Fitur',
-          sections: [
-            {
-              title: '💎 VVIP, QRIS & GRUP',
-              rows: [
-                { title: '📊 Cek Sisa Limit & VVIP', description: 'Lihat sisa kuota atau masa aktif VVIP Anda', id: 'limit' },
-                { title: '💳 Upgrade VVIP (QRIS DANA)', description: 'Pilih paket VVIP otomatis (Rp1rb - Rp10rb)', id: 'qris' },
-                { title: '📥 Menu Download', description: 'TikTok, YouTube, Spotify, IG, FB & File', id: 'downloadmenu' },
-                { title: '🛡️ Menu Keamanan Grup', description: 'Anti-Link, Auto ACC, Kick, Mute & Filter Member', id: 'keamanangrup' },
-                { title: '⚙️ Panel Otomatisasi Grup', description: 'Jadwal kegiatan, Welcome & Auto Buka/Tutup', id: 'panelgrup' },
-                { title: '📋 Daftar Lengkap Semua Fitur', description: 'Tampilkan seluruh perintah bot', id: 'allmenu' },
-              ],
-            },
-            {
-              title: '🛠️ PERBAIKAN & HIBURAN',
-              rows: [
-                { title: '🛠️ Perbaiki Semua Fitur', description: 'Jalankan auto-repair + reset enkripsi', id: 'autorepair' },
-                { title: '⚔️ Kuro Slash', description: 'Main tebas Oni dengan tombol sentuh', id: 'kuroslash' },
-                { title: '🌀 Speedy Dash', description: 'Main Sonic kumpulkan Gold Rings', id: 'sonic' },
-              ],
-            },
-          ],
-          buttons: [
-            { text: '📥 Menu Download', id: 'downloadmenu' },
-            { text: '🛡️ Keamanan Grup', id: 'keamanangrup' },
-            { text: '📋 Semua Fitur', id: 'allmenu' },
-          ],
-        }, msg);
-        return;
-      }
-
-      if (cmd === 'allmenu') {
-        let out = `*╭┈───〔 ${bot.userName} - SEMUA FITUR 〕┈───⊷*\n*├✦ Owner:* ${OWNER_NAME}\n*├✦ Total Aktif:* ${ALL_COMMANDS_SET.size} Fitur\n*╰───────────────────⊷*\n\n`;
-        for (const [cat, list] of Object.entries(MENU_CATEGORIES)) {
-          out += formatCategoryBox(cat, list) + '\n';
-        }
-        out += DOWNLOAD_MENU + '\n\n' + GROUP_SECURITY_MENU + '\n\n' + formatCategoryBox('GROUP_AUTOMATION', GROUP_AUTO_ONLY_COMMANDS) + '\n' + formatCategoryBox('LIMIT_PREMIUM', PREMIUM_COMMANDS) + '\n';
-        await sock.sendMessage(jid, { text: out, contextInfo: { forwardingScore: 999, isForwarded: true } }, { quoted: msg });
-        return;
-      }
-
-      if (cmd === 'groupmenu') { await sock.sendMessage(jid, { text: GROUP_SECURITY_MENU }, { quoted: msg }); return; }
-      const subMenus = { aimenu: 'AI', searchmenu: 'SEARCH', animemenu: 'ANIME', funmenu: 'FUN', logomenu: 'STICKER_LOGO', toolsmenu: 'TOOLS', ownermenu: 'OWNER' };
-      if (subMenus[cmd]) { await sock.sendMessage(jid, { text: formatCategoryBox(subMenus[cmd], MENU_CATEGORIES[subMenus[cmd]]) }, { quoted: msg }); return; }
-
-      if (['selftest', 'cekfitur', 'autorepair'].includes(cmd)) {
-        if (!isOwner && !isSenderAdmin) { await sock.sendMessage(jid, { text: '⛔ Perintah ini khusus Owner atau Admin Grup.' }, { quoted: msg }); return; }
-        await sock.sendMessage(jid, { text: '🔄 *Sedang menjalankan Auto-Repair & Reset Sesi Enkripsi...*' }, { quoted: msg });
-        await repairSignalSessionForJid(jid, 'Auto-Repair Triggered');
-        const rep = await jalankanAuditFiturRealTime(true);
-        await sock.sendMessage(jid, { text: `🩺 *LAPORAN AUDIT FITUR*\n🕒 ${rep.lastChecked}\n📊 *${rep.summary}*\n\n${Object.entries(rep.details).map(([k, v]) => `• *${k}:* ${v}`).join('\n')}` }, { quoted: msg });
-        return;
-      }
-      if (['ping', 'ping2', 'speed', 'os'].includes(cmd)) {
-        const hw = getServerHardwareStats();
-        const wib = new Date().toLocaleTimeString('id-ID', { timeZone: 'Asia/Jakarta', hour12: false }).replace(/:/g, '.');
-        await sock.sendMessage(jid, { text: `⚡ *SERVER STATUS*\n• Runtime: ${getUptime()}\n• RAM: ${hw.ramPercent}% ${hw.ramBar}\n• Disk: ${hw.diskPercent}% ${hw.diskBar}\n• Jam Server: ${wib} WIB` }, { quoted: msg });
-        return;
-      }
-      if (['alive', 'runtime', 'uptime'].includes(cmd)) { await sock.sendMessage(jid, { text: `🟢 *${bot.userName}* Aktif — ${getUptime()}` }, { quoted: msg }); return; }
-      if (cmd === 'owner') { await sock.sendMessage(jid, { text: `👤 *Owner:* ${OWNER_NAME}` }, { quoted: msg }); return; }
-      if (cmd === 'status') { await sock.sendMessage(jid, { text: `📊 *STATUS*\n• Fitur Aktif: ${ALL_COMMANDS_SET.size}\n• Auto-Repair Total: ${serverAutoHeal.totalAutoRepairs}x` }, { quoted: msg }); return; }
-      if (cmd === 'update') {
-        if (!isOwner) { await sock.sendMessage(jid, { text: '⛔ Perintah ini khusus Owner Bot.' }, { quoted: msg }); return; }
-        await sock.sendMessage(jid, { text: `🧬 *UPDATE SELESAI*\n${await jalankanEvolusiMandiri(true)}` }, { quoted: msg });
-        return;
-      }
-
-      if (cmd === 'memori') { const f = dbMemory.users[senderNum]?.facts || []; await sock.sendMessage(jid, { text: f.length ? `🧠 *Ingatan:*\n• ${f.join('\n• ')}` : '🧠 Memori kosong.' }, { quoted: msg }); return; }
-      if (cmd === 'resetmemori') { if (dbMemory.users[senderNum]) dbMemory.users[senderNum].facts = []; await saveMemory(); await sock.sendMessage(jid, { text: '✅ Memori direset.' }, { quoted: msg }); return; }
-      if (MENU_CATEGORIES.AI.includes(cmd)) {
-        if (!param) { await sock.sendMessage(jid, { text: `⚠️ Contoh: \`.${cmd} jelaskan cara kerja AI\`` }, { quoted: msg }); return; }
-        await sock.sendMessage(jid, { text: (await panggilServerAISatSet(param, `Kamu adalah ${bot.userName}. Jawab singkat, cerdas, dan akurat dalam Bahasa Indonesia.`)) || '⏳ Server AI sibuk, coba ulangi.' }, { quoted: msg });
-        return;
-      }
-
-      if (cmd === 'setlokasi' || cmd === 'lokasi') {
-        if (!param) {
-          const curCity = ensureUserRecord(dbMemory, senderNum).city;
-          await sock.sendMessage(jid, { text: curCity ? `📍 Lokasi kamu saat ini: *${curCity}*\nKetik \`.lokasi di <kota baru>\` untuk mengubah.` : '⚠️ Contoh: `.lokasi di bandung`' }, { quoted: msg });
-          return;
-        }
-        const cleanCity = param.replace(/^di\s+/i, '').trim();
-        ensureUserRecord(dbMemory, senderNum).city = cleanCity;
-        await saveMemory();
-        await sock.sendMessage(jid, { text: `📍 Lokasi disimpan ke *${cleanCity}*.\n\n${await getCuacaKotaAkurat(cleanCity)}` }, { quoted: msg });
-        return;
-      }
-      if (cmd === 'cuaca' || cmd === 'wthr') {
-        const userRec = ensureUserRecord(dbMemory, senderNum);
-        const targetCity = param ? param.replace(/^di\s+/i, '').trim() : userRec.city || 'Jakarta';
-        if (param && !userRec.city) { userRec.city = targetCity; await saveMemory(); }
-        await sock.sendMessage(jid, { text: (await getCuacaKotaAkurat(targetCity)) || '❌ Kota tidak ditemukan.' }, { quoted: msg });
-        return;
-      }
-      if (cmd === 'praytime') { await sock.sendMessage(jid, { text: (await getJadwalSholatIndonesia(param || ensureUserRecord(dbMemory, senderNum).city || 'Jakarta')) || '❌ Jadwal tidak ditemukan.' }, { quoted: msg }); return; }
-      if (cmd === 'surah') {
-        const s = await getSurahLengkap(param || '1');
-        if (s) {
-          await sock.sendMessage(jid, { text: s.text }, { quoted: msg });
-          const b = s.audioUrl ? await fetchBuffer(s.audioUrl).catch(() => null) : null;
-          if (b) await sock.sendMessage(jid, { audio: b, mimetype: 'audio/mpeg' }, { quoted: msg });
-        }
-        return;
-      }
-      if (cmd === 'wiki' && param) { const d = await (await fetchWithTimeout(`https://id.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(param)}`).catch(() => ({ json: () => null }))).json(); await sock.sendMessage(jid, { text: d?.extract ? `📚 *${d.title}*\n\n${d.extract}` : '❌ Tidak ditemukan.' }, { quoted: msg }); return; }
-      if (cmd === 'npm' && param) { const d = await (await fetchWithTimeout(`https://registry.npmjs.org/${encodeURIComponent(param)}`).catch(() => ({ json: () => null }))).json(); await sock.sendMessage(jid, { text: d?.name ? `📦 *${d.name}* v${d['dist-tags']?.latest}\n${d.description || ''}` : '❌ Tidak ditemukan.' }, { quoted: msg }); return; }
-      if (['define', 'fakta', 'motivasi', 'kbbi'].includes(cmd)) { await sock.sendMessage(jid, { text: (await panggilServerAISatSet(`Berikan ${cmd} untuk "${param || 'Indonesia'}" secara singkat dalam Bahasa Indonesia.`, 'Jawab akurat dan ringkas.')) || '❌ Data tidak tersedia.' }, { quoted: msg }); return; }
-
-      if (MENU_CATEGORIES.ANIME.includes(cmd)) { const u = await getAnimeImageUrl(cmd); if (u) await sock.sendMessage(jid, { image: { url: u }, caption: `✨ *${cmd.toUpperCase()}*` }, { quoted: msg }); return; }
-      if (cmd === 'kuroslash' || cmd === 'slash') { const st = { type: 'kuroslash', lane: 1, hp: 100, score: 0, best: dbMemory.gameHighScores.kuroslash[senderNum] || 0, ulti: 35, wave: 0 }; gameSessions.set(jid, st); await kirimTampilanKuroSlash(sock, jid, senderNum, st, 'Tekan tombol di bawah untuk bermain!', msg); return; }
-      if (cmd === 'sonic' || cmd === 'speedydash') { const st = { type: 'sonic', rings: 10, score: 0, best: dbMemory.gameHighScores.sonic[senderNum] || 0, laserAlert: false }; gameSessions.set(jid, st); await kirimTampilanSonic(sock, jid, senderNum, st, 'Tekan BOOST atau JUMP di bawah!', msg); return; }
-      if (cmd === 'game') { gameSessions.set(jid, { type: 'angka', answer: Math.floor(Math.random() * 10) + 1 }); await sock.sendMessage(jid, { text: '🎮 *Tebak Angka 1 sampai 10*\nKirim tebakanmu!' }, { quoted: msg }); return; }
-      if (cmd === 'mathgame') { const a = Math.floor(Math.random() * 25) + 5, b = Math.floor(Math.random() * 25) + 5; gameSessions.set(jid, { type: 'math', answer: a + b }); await sock.sendMessage(jid, { text: `🧮 Berapa *${a} + ${b}*?` }, { quoted: msg }); return; }
-      if (cmd === 'tebakkata') { gameSessions.set(jid, { type: 'kata', answer: 'peta' }); await sock.sendMessage(jid, { text: '🧩 Punya gunung tapi tidak punya pohon, punya kota tapi tidak punya rumah. Apakah aku?' }, { quoted: msg }); return; }
-      if (cmd === 'suit') { const p = ['batu', 'gunting', 'kertas'], u = param.toLowerCase(); await sock.sendMessage(jid, { text: p.includes(u) ? `✊✌️✋ Kamu: *${u}* | Bot: *${p[Math.floor(Math.random() * 3)]}*` : '⚠️ Contoh: `.suit batu`' }, { quoted: msg }); return; }
-      if (cmd === 'dice') { await sock.sendMessage(jid, { text: `🎲 Dadu: *${Math.floor(Math.random() * 6) + 1}*` }, { quoted: msg }); return; }
-      if (cmd === 'coin') { await sock.sendMessage(jid, { text: `🪙 Koin: *${Math.random() < 0.5 ? 'ANGKA' : 'GAMBAR'}*` }, { quoted: msg }); return; }
-      if (cmd === '8ball') { await sock.sendMessage(jid, { text: `🎱 *${['Ya pasti!', 'Mungkin iya.', 'Coba lagi.', 'Tidak.'][Math.floor(Math.random() * 4)]}*` }, { quoted: msg }); return; }
-      if (['rate', 'aura', 'sigma', 'rizz', 'vibe', 'npc', 'maincharacter', 'delulu', 'redflag', 'greenflag', 'compatibility', 'ship'].includes(cmd)) { await sock.sendMessage(jid, { text: `📊 *${cmd.toUpperCase()}:* ${Math.floor(Math.random() * 101)}%` }, { quoted: msg }); return; }
-      if (['roast', 'compliment', 'pickup', 'quote', 'joke', 'truth', 'dare', 'wyr', 'horoscope'].includes(cmd)) { await sock.sendMessage(jid, { text: (await panggilServerAISatSet(`Buat 1 ${cmd} singkat dan sopan dalam Bahasa Indonesia untuk ${param || pushName}.`, 'Jawab singkat.')) || '✨ Semangat hari ini!' }, { quoted: msg }); return; }
-      if (['hug', 'pat', 'wave', 'dance'].includes(cmd)) { const u = await getAnimeImageUrl(cmd); if (u) await sock.sendMessage(jid, { image: { url: u }, caption: `*${pushName}* melakukan *${cmd}*` }, { quoted: msg }); return; }
-
-      if (['sticker', 'stiker', 's'].includes(cmd)) {
-        const qMsg = unwrapMessageContent(unwrapped.extendedTextMessage?.contextInfo?.quotedMessage);
-        const media = unwrapped.imageMessage || qMsg?.imageMessage || unwrapped.videoMessage || qMsg?.videoMessage;
-        const isVid = Boolean(unwrapped.videoMessage || qMsg?.videoMessage);
-        if (media) {
-          let b = Buffer.from([]);
-          for await (const c of await downloadContentFromMessage(media, isVid ? 'video' : 'image')) b = Buffer.concat([b, c]);
-          const webp = await mediaBufferToWebpSticker(b, isVid);
-          if (webp) await sock.sendMessage(jid, { sticker: webp }, { quoted: msg });
-        } else if (param) {
-          const webp = await urlOrTextToWebpSticker(param);
-          if (webp) await sock.sendMessage(jid, { sticker: webp }, { quoted: msg });
-        }
-        return;
-      }
-      if (['brat', 'bratvid', 'bratvideo'].includes(cmd)) { const webp = await createBratSticker(param || 'brat', cmd !== 'brat'); if (webp) await sock.sendMessage(jid, { sticker: webp }, { quoted: msg }); return; }
-      if (['ttp', 'attp', 'qc'].includes(cmd) && param) { const webp = await urlOrTextToWebpSticker(param); if (webp) await sock.sendMessage(jid, { sticker: webp }, { quoted: msg }); return; }
-      if (cmd === 'animasi' || cmd === 'linkvideo') { const u = extractUrl(param) || `https://dummyimage.com/800x450/0f172a/38bdf8.png&text=${encodeURIComponent(param || 'HD')}`; await sock.sendMessage(jid, { image: { url: `https://api.microlink.io/?url=${encodeURIComponent(u)}&screenshot=true&meta=false&embed=screenshot.url` }, caption: '✨ Visual HD' }, { quoted: msg }); return; }
-      if ((cmd === 'font' || cmd === 'fancy') && param) { await sock.sendMessage(jid, { text: FONT_MAPS.map((_, i) => `${i + 1}. ${applyFont(param, i)}`).join('\n') }, { quoted: msg }); return; }
-      const logoColors = { logo: '0f172a/38bdf8', neon: '090d16/00ffcc', gold: '1c1917/facc15', galaxy: '1e1b4b/c084fc', glitch: '18181b/f43f5e', matrix: '022c22/4ade80', graffiti: '312e81/fb923c', thunder: '0c4a6e/fde047' };
-      if (logoColors[cmd] && param) { await sock.sendMessage(jid, { image: { url: `https://dummyimage.com/800x400/${logoColors[cmd]}.png&text=${encodeURIComponent(param)}` } }, { quoted: msg }); return; }
-
-      if (['rvo', 'rvop', 'vv'].includes(cmd)) {
-        const vo = await extractAndDownloadViewOnce(unwrapped.extendedTextMessage?.contextInfo?.quotedMessage);
-        if (!vo?.buffer) { await sock.sendMessage(jid, { text: '⚠️ Balas pesan View Once dengan `.rvo`' }, { quoted: msg }); return; }
-        const target = cmd === 'rvop' ? rawParticipant : jid;
-        await sock.sendMessage(target, vo.type === 'audio' ? { audio: vo.buffer, mimetype: 'audio/mpeg', ptt: true } : { [vo.type]: vo.buffer, caption: `👁️ RVO\n${vo.caption}` });
-        return;
-      }
-      if (cmd === 'hitung' && param) { const r = safeEvaluateMath(param); await sock.sendMessage(jid, { text: r === null ? '⚠️ Format perhitungan tidak valid. Contoh: `.hitung (25 + 15) * 2`' : `🧮 *${param}* = *${r}*` }, { quoted: msg }); return; }
-      if (cmd === 'catat' && param) { (dbMemory.notes[jid] ||= []).push(param); await saveMemory(); await sock.sendMessage(jid, { text: '📝 Tersimpan!' }, { quoted: msg }); return; }
-      if (cmd === 'catatan') { const l = dbMemory.notes[jid] || []; await sock.sendMessage(jid, { text: l.length ? l.map((v, i) => `${i + 1}. ${v}`).join('\n') : '📭 Kosong.' }, { quoted: msg }); return; }
-      if ((cmd === 'terjemah' || cmd === 'translate') && args[1] && args[2]) { await sock.sendMessage(jid, { text: (await panggilServerAISatSet(`Terjemahkan ke ${args[1]}: ${args.slice(2).join(' ')}`, 'Terjemahkan saja.')) || '-' }, { quoted: msg }); return; }
-      if (cmd === 'id') { await sock.sendMessage(jid, { text: `🆔 \`${jid}\`` }, { quoted: msg }); return; }
-      if (cmd === 'getpp') { const pp = await sock.profilePictureUrl(rawParticipant, 'image').catch(() => null); await sock.sendMessage(jid, pp ? { image: { url: pp } } : { text: '❌ Privat.' }, { quoted: msg }); return; }
-      if (cmd === 'getbio') { const st = await sock.fetchStatus(rawParticipant).catch(() => null); await sock.sendMessage(jid, { text: `📝 ${st?.status || '-'}` }, { quoted: msg }); return; }
-      if (cmd === 'gpass') { const c = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%'; await sock.sendMessage(jid, { text: `🔐 \`${Array.from({ length: 12 }, () => c[Math.floor(Math.random() * c.length)]).join('')}\`` }, { quoted: msg }); return; }
-      if (cmd === 'qr' && param) { await sock.sendMessage(jid, { image: { url: `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(param)}` } }, { quoted: msg }); return; }
-      if (cmd === 'shorturl' && extractUrl(param)) { await sock.sendMessage(jid, { text: `🔗 ${await (await fetchWithTimeout(`https://tinyurl.com/api-create.php?url=${encodeURIComponent(extractUrl(param))}`)).text()}` }, { quoted: msg }); return; }
-      if (cmd === 'waktu') { await sock.sendMessage(jid, { text: `🕒 ${new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })} WIB` }, { quoted: msg }); return; }
-      if (cmd === 'base64' && param) { await sock.sendMessage(jid, { text: Buffer.from(param).toString('base64') }, { quoted: msg }); return; }
-      if (cmd === 'reverse' && param) { await sock.sendMessage(jid, { text: param.split('').reverse().join('') }, { quoted: msg }); return; }
-      if (cmd === 'ssweb' && extractUrl(param)) { await sock.sendMessage(jid, { image: { url: `https://api.microlink.io/?url=${encodeURIComponent(extractUrl(param))}&screenshot=true&meta=false&embed=screenshot.url` } }, { quoted: msg }); return; }
-
-      if (MENU_CATEGORIES.OWNER.includes(cmd)) {
-        if (!isOwner) { await sock.sendMessage(jid, { text: '⛔ Perintah ini khusus Owner Bot.' }, { quoted: msg }); return; }
-        if (['setnama', 'setname', 'botname'].includes(cmd) && param) { bot.userName = dbMemory.botSettings.customBotName = param; await saveMemory(); await sock.updateProfileName(param).catch(() => {}); await sock.sendMessage(jid, { text: `✅ Nama bot: *${param}*` }, { quoted: msg }); }
-        else if (cmd === 'updatebio' && param) { await sock.updateProfileStatus(param); await sock.sendMessage(jid, { text: '✅ Bio bot diperbarui.' }, { quoted: msg }); }
-        else if ((cmd === 'block' || cmd === 'unblock') && param) { await sock.updateBlockStatus(`${param.replace(/\D/g, '')}@s.whatsapp.net`, cmd); await sock.sendMessage(jid, { text: `✅ Berhasil ${cmd} nomor.` }, { quoted: msg }); }
-        else if (cmd === 'blocklist') await sock.sendMessage(jid, { text: `🚫 Diblokir: ${(await sock.fetchBlocklist()).length}` }, { quoted: msg });
-        else if (cmd === 'autoread' || cmd === 'autotyping') { dbMemory.botSettings[cmd] = !dbMemory.botSettings[cmd]; await saveMemory(); await sock.sendMessage(jid, { text: `${cmd}: ${dbMemory.botSettings[cmd]}` }, { quoted: msg }); }
-        else if (cmd === 'mode' && ['public', 'self'].includes(param)) { dbMemory.botSettings.mode = param; await saveMemory(); await sock.sendMessage(jid, { text: `Mode: ${param}` }, { quoted: msg }); }
-        else if (cmd === 'badwords') await sock.sendMessage(jid, { text: `Total filter: ${bot.badWords.length + dbMemory.learnedWords.length}` }, { quoted: msg });
-        else if (cmd === 'addkata' && param) { dbMemory.learnedWords.push(param.toLowerCase()); await saveMemory(); await sock.sendMessage(jid, { text: '✅ Kata filter ditambahkan.' }, { quoted: msg }); }
-        else if (cmd === 'delkata' && param) { dbMemory.learnedWords = dbMemory.learnedWords.filter((w) => w !== param.toLowerCase()); await saveMemory(); await sock.sendMessage(jid, { text: '✅ Kata filter dihapus.' }, { quoted: msg }); }
-        else if (cmd === 'clean') { if (global.gc) global.gc(); await sock.sendMessage(jid, { text: '🧹 Cache dibersihkan.' }, { quoted: msg }); }
-        return;
-      }
+      if (await runCommand(cc)) return;
     }
 
     if (isGroup) {
@@ -665,16 +706,17 @@ async function prosesSatuPesan(sock, msg) {
       return;
     }
 
-    if (rawText.length < 2) return;
-    if (!(await checkAndConsumeDailyLimit({ sock, jid, senderNum, isOwner, isSenderAdmin: false, cmd: 'chat_ai', msg, dbMemory, saveMemory })).allowed) return;
-    const reply = await panggilServerAISatSet(rawText, `Kamu adalah ${bot.userName}, asisten WhatsApp cerdas.`);
-    if (reply) await sock.sendMessage(jid, { text: reply }, { quoted: msg });
+    if (rawText.length < 2 || !(await limit('chat_ai')).allowed) return;
+    const ai = await askAI(rawText, `Kamu adalah ${bot.userName}, asisten WhatsApp cerdas.`);
+    if (ai) await reply(ai);
   } catch (err) {
     const m = err?.message || 'Error';
-    if (/Bad MAC|SessionError|No matching sessions|Invalid PreKey/i.test(m)) await triggerAutoCipherHeal(msg?.key?.remoteJid || '', m);
+    if (SIGNAL_ERR.test(m)) await triggerAutoCipherHeal(msg?.key?.remoteJid || '', m);
     else recordAutoRepair('Handler', m, 'Pesan diisolasi');
   }
 }
+
+/* ═════════════════════════ KONEKSI WHATSAPP ═════════════════════════ */
 
 let backgroundLoopsStarted = false;
 let isReconnecting = false;
@@ -695,9 +737,7 @@ async function start() {
     setTimeout(() => jalankanAuditFiturRealTime(false), 8000);
     setInterval(() => jalankanAuditFiturRealTime(false), 5 * 60 * 1000);
     setupGracefulShutdown(bot, saveMemory);
-    startGitHubLiveHotReload(async (commitId) => {
-      await jalankanAuditFiturRealTime(true);
-    });
+    startGitHubLiveHotReload(() => jalankanAuditFiturRealTime(true));
   }
 
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
@@ -726,18 +766,15 @@ async function start() {
   sock.ev.on('creds.update', async () => { await saveCreds(); scheduleAuthBackupToGitHub(AUTH_DIR); });
   sock.ev.on('messages.update', async (updates) => {
     for (const u of updates) {
-      const targetJid = u.key?.remoteJid;
-      if (!targetJid || !u.key?.fromMe) continue;
-      if (Boolean(u.update?.messageStubType) || u.update?.status === 0) {
-        if (Date.now() - (retryCooldownByJid.get(targetJid) || 0) < 8000) continue;
-        retryCooldownByJid.set(targetJid, Date.now());
-        await repairSignalSessionForJid(targetJid, 'Terdeteksi Menunggu Pesan Ini');
-        const fallbackText = lastReplyTextByJid.get(targetJid);
-        if (fallbackText) await origSendMessage(targetJid, { text: `🔄 *Auto-Repair Enkripsi Berhasil:*\n\n${fallbackText}` }).catch(() => {});
-      }
+      const target = u.key?.remoteJid;
+      if (!target || !u.key?.fromMe || !(u.update?.messageStubType || u.update?.status === 0)) continue;
+      if (Date.now() - (retryCooldownByJid.get(target) || 0) < 8000) continue;
+      retryCooldownByJid.set(target, Date.now());
+      await repairSignalSessionForJid(target, 'Terdeteksi Menunggu Pesan Ini');
+      const fallback = lastReplyTextByJid.get(target);
+      if (fallback) await origSendMessage(target, { text: `🔄 *Auto-Repair Enkripsi Berhasil:*\n\n${fallback}` }).catch(() => {});
     }
   });
-
   sock.ev.on('messages.upsert', ({ messages, type }) => { if (type === 'notify') for (const m of messages) prosesSatuPesan(sock, m).catch(() => {}); });
   sock.ev.on('group-participants.update', (u) => handleGroupParticipantsUpdate(sock, dbMemory, u).catch(() => {}));
   sock.ev.on('group.join-request', (e) => handleGroupJoinRequestEvent(sock, dbMemory, e).catch(() => {}));
@@ -745,25 +782,25 @@ async function start() {
   startGroupAutomationScheduler(sock, dbMemory, saveMemory);
   startPremiumAndQrisWatcher(sock, dbMemory, saveMemory);
 
+  const formatPairing = (code) => code?.match(/.{1,4}/g)?.join('-') || code;
   sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
     if (qr && !bot.connected) {
       bot.qr = qr;
-      if (PHONE && !bot.registered && !bot.pairingCode) setTimeout(() => {
-        sock.requestPairingCode(PHONE).then((c) => {
-          bot.pairingCode = c?.match(/.{1,4}/g)?.join('-') || c;
+      if (PHONE && !bot.registered && !bot.pairingCode) {
+        setTimeout(() => sock.requestPairingCode(PHONE).then((code) => {
+          bot.pairingCode = formatPairing(code);
           console.log(`🔑 KODE OTP BOT: ${bot.pairingCode}`);
-        }).catch(() => {});
-      }, 2000);
+        }).catch(() => {}), 2000);
+      }
     }
     if (connection === 'open') {
-      bot.connected = true; bot.registered = true; bot.qr = null; bot.pairingCode = null;
-      bot.userPhone = sock.user?.id ? sock.user.id.split(':')[0] : PHONE;
+      Object.assign(bot, { connected: true, registered: true, qr: null, pairingCode: null, userPhone: sock.user?.id ? sock.user.id.split(':')[0] : PHONE });
       scheduleAuthBackupToGitHub(AUTH_DIR);
       console.log(`✅ [TERHUBUNG] ${bot.userPhone} — Semua Sistem Aktif`);
     } else if (connection === 'close') {
       bot.connected = false;
       if (lastDisconnect?.error?.output?.statusCode === DisconnectReason.loggedOut) {
-        bot.registered = false; bot.pairingCode = null; bot.qr = null;
+        Object.assign(bot, { registered: false, pairingCode: null, qr: null });
         await saveMemory();
         fs.rmSync(AUTH_DIR, { recursive: true, force: true });
         scheduleReconnect(5000);
@@ -781,7 +818,7 @@ mulaiWeb({
   getFeatureCount: () => ALL_COMMANDS_SET.size,
   requestNewPairingCode: () => {
     bot.pairingCode = null;
-    return bot.sock?.requestPairingCode(PHONE).then((c) => { bot.pairingCode = c?.match(/.{1,4}/g)?.join('-') || c; }).catch(() => {});
+    return bot.sock?.requestPairingCode(PHONE).then((code) => { bot.pairingCode = code?.match(/.{1,4}/g)?.join('-') || code; }).catch(() => {});
   },
 });
 start();
