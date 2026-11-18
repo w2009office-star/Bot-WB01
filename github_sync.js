@@ -1,118 +1,168 @@
 import fs from 'fs';
 import fsPromises from 'fs/promises';
 import path from 'path';
-import { execSync } from 'child_process';
+import crypto from 'crypto';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
-const GITHUB_REPO = process.env.GITHUB_REPO || ''; // contoh: username/whuxen-bot
-const GITHUB_BRANCH = process.env.GITHUB_BRANCH || 'main';
-const BACKUP_PATH = 'auth_backup.json';
+const exec = promisify(execFile);
+const env = (key, fallback = '') => process.env[key] || fallback;
+const TOKEN = env('GITHUB_TOKEN');
+const REPO = env('GITHUB_REPO');
+const BRANCH = env('GITHUB_BRANCH', 'main');
+const BACKUP_BRANCH = env('GITHUB_BACKUP_BRANCH', 'session-backup');
+const BACKUP_FILE = 'auth_backup.json';
+const BACKUP_DELAY_MS = 5000;
+const enabled = Boolean(TOKEN && REPO);
 
-// 1. PULIHKAN SESI LOGIN SEBELUM BOT KONEK (ANTI-SCAN ULANG SAAT REDEPLOY)
-export async function restoreAuthFromGitHub(authDir = './auth') {
-  const credsFile = path.join(authDir, 'creds.json');
-  if (fs.existsSync(credsFile)) return true;
-  if (!GITHUB_TOKEN || !GITHUB_REPO) return false;
+const warn = (where, e) => console.warn(`[github_sync] ${where}:`, e?.message || e);
+const credsPath = (dir) => path.join(dir, 'creds.json');
+const sha1 = (text) => crypto.createHash('sha1').update(text).digest('hex');
 
+const gh = (endpoint, method = 'GET', body) => fetch(`https://api.github.com/repos/${REPO}/${endpoint}`, {
+  method,
+  headers: {
+    Authorization: `Bearer ${TOKEN}`,
+    Accept: 'application/vnd.github+json',
+    'Content-Type': 'application/json',
+    'User-Agent': 'WHUXEN-BOT',
+  },
+  ...(body && { body: JSON.stringify(body) }),
+});
+
+/* ── Pulihkan sesi ── */
+
+let restoreDone = false;
+
+async function restoreFrom(ref, authDir) {
   try {
-    const res = await fetch(
-      `https://api.github.com/repos/${GITHUB_REPO}/contents/${BACKUP_PATH}?ref=${GITHUB_BRANCH}`,
-      {
-        headers: {
-          Authorization: `Bearer ${GITHUB_TOKEN}`,
-          Accept: 'application/vnd.github+json',
-          'User-Agent': 'WHUXEN-BOT',
-        },
-      }
-    );
+    const res = await gh(`contents/${BACKUP_FILE}?ref=${ref}`);
     if (!res.ok) return false;
-    const data = await res.json();
-    if (!data?.content) return false;
-
-    const decoded = Buffer.from(data.content, 'base64').toString('utf-8');
-    JSON.parse(decoded); // Pastikan JSON valid
-
+    const creds = Buffer.from((await res.json()).content || '', 'base64').toString('utf-8');
+    JSON.parse(creds);
     await fsPromises.mkdir(authDir, { recursive: true });
-    await fsPromises.writeFile(credsFile, decoded, 'utf-8');
-    console.log('✅ [AUTH RESTORE] Sesi WhatsApp berhasil dipulihkan dari GitHub!');
+    await fsPromises.writeFile(credsPath(authDir), creds);
+    console.log(`✅ [AUTH RESTORE] Sesi WhatsApp dipulihkan dari GitHub (${ref})`);
     return true;
-  } catch {
+  } catch (e) {
+    warn(`restore ${ref}`, e);
     return false;
   }
 }
 
-// 2. SIMPAN OTOMATIS CREDS.JSON KE GITHUB TIAP ADA UPDATE KUNCI
-let backupTimer = null;
+export async function restoreAuthFromGitHub(authDir = './auth') {
+  const first = !restoreDone;
+  restoreDone = true; // setelah logout, jangan pulihkan sesi lama lagi
+  if (fs.existsSync(credsPath(authDir))) return true;
+  if (!first || !enabled) return false;
+  for (const ref of new Set([BACKUP_BRANCH, BRANCH])) {
+    if (await restoreFrom(ref, authDir)) return true;
+  }
+  return false;
+}
+
+/* ── Backup sesi ── */
+
+let timer = null;
+let chain = Promise.resolve();
+let backupDir = './auth';
+let branchReady = false;
+let lastHash = '';
+let lastSha = '';
+
+async function ensureBackupBranch() {
+  if (branchReady || BACKUP_BRANCH === BRANCH) return;
+  if (!(await gh(`git/ref/heads/${BACKUP_BRANCH}`)).ok) {
+    const base = await (await gh(`git/ref/heads/${BRANCH}`)).json();
+    const res = await gh('git/refs', 'POST', { ref: `refs/heads/${BACKUP_BRANCH}`, sha: base.object?.sha });
+    if (!res.ok) throw new Error(`gagal membuat branch ${BACKUP_BRANCH} (HTTP ${res.status})`);
+  }
+  branchReady = true;
+}
+
+const currentSha = async () => (await (await gh(`contents/${BACKUP_FILE}?ref=${BACKUP_BRANCH}`)).json().catch(() => ({}))).sha;
+
+const putBackup = (raw, sha) => gh(`contents/${BACKUP_FILE}`, 'PUT', {
+  message: 'chore: sync whatsapp session [skip ci]',
+  content: Buffer.from(raw).toString('base64'),
+  branch: BACKUP_BRANCH,
+  ...(sha && { sha }),
+});
+
+async function backupNow() {
+  const raw = await fsPromises.readFile(credsPath(backupDir), 'utf-8').catch(() => '');
+  const hash = sha1(raw);
+  if (!raw || hash === lastHash) return;
+  JSON.parse(raw);
+  await ensureBackupBranch();
+  let res = await putBackup(raw, lastSha || (await currentSha()));
+  if (!res.ok) res = await putBackup(raw, await currentSha());
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  lastHash = hash;
+  lastSha = (await res.json()).content?.sha || '';
+}
+
+const safeBackup = () => (chain = chain.then(() => backupNow().catch((e) => warn('backup', e))));
+
 export function scheduleAuthBackupToGitHub(authDir = './auth') {
-  if (!GITHUB_TOKEN || !GITHUB_REPO) return;
-  if (backupTimer) clearTimeout(backupTimer);
-
-  backupTimer = setTimeout(async () => {
-    try {
-      const credsFile = path.join(authDir, 'creds.json');
-      if (!fs.existsSync(credsFile)) return;
-      const raw = await fsPromises.readFile(credsFile, 'utf-8');
-      JSON.parse(raw);
-
-      const apiUrl = `https://api.github.com/repos/${GITHUB_REPO}/contents/${BACKUP_PATH}`;
-      const headers = {
-        Authorization: `Bearer ${GITHUB_TOKEN}`,
-        Accept: 'application/vnd.github+json',
-        'Content-Type': 'application/json',
-        'User-Agent': 'WHUXEN-BOT',
-      };
-
-      let sha = undefined;
-      const checkRes = await fetch(`${apiUrl}?ref=${GITHUB_BRANCH}`, { headers });
-      if (checkRes.ok) {
-        const existing = await checkRes.json();
-        sha = existing.sha;
-      }
-
-      // Gunakan [skip ci] agar backup sesi tidak memicu redeploy berulang di hosting
-      await fetch(apiUrl, {
-        method: 'PUT',
-        headers,
-        body: JSON.stringify({
-          message: 'chore: sync whatsapp session [skip ci]',
-          content: Buffer.from(raw).toString('base64'),
-          branch: GITHUB_BRANCH,
-          ...(sha ? { sha } : {}),
-        }),
-      });
-    } catch {}
-  }, 5000);
+  if (!enabled) return;
+  backupDir = authDir;
+  timer ??= setTimeout(() => { timer = null; safeBackup(); }, BACKUP_DELAY_MS);
 }
 
-// 3. LIVE HOT-RELOAD DARI GITHUB TANPA MUTUSIN KONEKSI WHATSAPP
+export async function flushAuthBackup() {
+  if (!enabled || !timer) return;
+  clearTimeout(timer);
+  timer = null;
+  await safeBackup();
+}
+
+/* ── Hot reload kode ── */
+
+const git = (...args) => exec('git', args, { timeout: 20000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } }).then((r) => r.stdout.trim());
+
+async function pullIfUpdated(onCodeUpdated) {
+  if (!fs.existsSync('.git')) return;
+  await git('fetch', 'origin', BRANCH);
+  const [local, remote] = await Promise.all([git('rev-parse', 'HEAD'), git('rev-parse', `origin/${BRANCH}`)]);
+  if (local === remote) return;
+  await git('pull', '--ff-only', 'origin', BRANCH);
+  console.log(`🔄 [LIVE UPDATE] Kode baru ditarik (${remote.slice(0, 7)})`);
+  await onCodeUpdated?.(remote.slice(0, 7));
+}
+
 export function startGitHubLiveHotReload(onCodeUpdated) {
+  let busy = false;
+  let lastError = '';
   setInterval(async () => {
+    if (busy) return;
+    busy = true;
     try {
-      if (!fs.existsSync('.git')) return;
-      execSync(`git fetch origin ${GITHUB_BRANCH}`, { stdio: 'ignore', timeout: 10000 });
-      const localHash = execSync('git rev-parse HEAD', { encoding: 'utf-8' }).trim();
-      const remoteHash = execSync(`git rev-parse origin/${GITHUB_BRANCH}`, { encoding: 'utf-8' }).trim();
-
-      if (localHash && remoteHash && localHash !== remoteHash) {
-        execSync(`git pull origin ${GITHUB_BRANCH}`, { stdio: 'ignore', timeout: 15000 });
-        console.log(`🔄 [LIVE UPDATE] Kode GitHub baru ditarik (${remoteHash.slice(0, 7)}) tanpa mutusin WA!`);
-        if (typeof onCodeUpdated === 'function') {
-          await onCodeUpdated(remoteHash.slice(0, 7));
-        }
-      }
-    } catch {}
-  }, 60 * 1000); // Cek editan GitHub tiap 60 detik
+      await pullIfUpdated(onCodeUpdated);
+      lastError = '';
+    } catch (e) {
+      if (e.message !== lastError) warn('hot-reload', e);
+      lastError = e.message;
+    } finally {
+      busy = false;
+    }
+  }, 60 * 1000);
 }
 
-// 4. TUTUP SOCKET DENGAN HALUS SAAT REDEPLOY AGAR PERANGKAT TETAP TERDAFTAR
+/* ── Shutdown ── */
+
 export function setupGracefulShutdown(botRef, saveMemoryFn) {
+  let closing = false;
+  const step = (fn) => Promise.resolve().then(fn).catch((e) => warn('shutdown', e));
   const cleanExit = async () => {
-    try {
-      if (typeof saveMemoryFn === 'function') await saveMemoryFn();
-      if (botRef?.sock?.ws) botRef.sock.ws.close();
-    } catch {}
+    if (closing) return;
+    closing = true;
+    await Promise.race([
+      Promise.all([step(() => saveMemoryFn?.()), step(flushAuthBackup)]),
+      new Promise((resolve) => setTimeout(resolve, 8000)),
+    ]);
+    await step(() => botRef?.sock?.ws?.close());
     process.exit(0);
   };
-  process.on('SIGTERM', cleanExit);
-  process.on('SIGINT', cleanExit);
+  ['SIGTERM', 'SIGINT'].forEach((signal) => process.on(signal, cleanExit));
 }
