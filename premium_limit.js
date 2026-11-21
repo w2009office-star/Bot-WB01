@@ -30,7 +30,7 @@ export const PREMIUM_PACKAGES = {
 };
 
 export const LIMIT_EXEMPT_COMMANDS = new Set([
-  'menu', 'help', 'limit', 'ceklimit', 'premium', 'belipremium', 'qris', 'cekstatus', 'konfirmasi', 'owner',
+  'menu', 'help', 'limit', 'ceklimit', 'premium', 'belipremium', 'qris', 'cekstatus', 'konfirmasi', 'owner', 'laporkanerror', 'reporterror', 'lapor', 'id',
 ]);
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {

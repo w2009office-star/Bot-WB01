@@ -130,10 +130,11 @@ const QUIZ = {
 const SEARCH = ['pinterest', 'pint', 'pixiv', 'gimage', 'tenor', 'ringtone', 'styletext', 'emojimix', 'iqc', 'khodam'];
 
 export const NAZE_COMMANDS = [
-  ...Object.keys(TEXT_RANDOM), ...Object.keys(IMAGE_FORM), ...Object.keys(NEO_MODELS), ...Object.keys(QUIZ), ...SEARCH, 'nyerah',
+  ...Object.keys(TEXT_RANDOM), ...Object.keys(IMAGE_FORM), ...Object.keys(NEO_MODELS), ...Object.keys(QUIZ), ...SEARCH, 'nyerah', 'laporkanerror', 'reporterror', 'lapor',
 ];
 
 const quizzes = new Map();
+const reportCooldown = new Map(); // senderNum → waktu laporan terakhir
 const isImg = (b) => b?.length > 4 && ((b[0] === 0xff && b[1] === 0xd8) || (b[0] === 0x89 && b[1] === 0x50) || b.subarray(0, 4).toString() === 'RIFF');
 const done = async (p) => { await p; return true; };
 
@@ -191,6 +192,21 @@ export async function handleNazeCommand(c, deps) {
   const { cmd, param } = c;
   const useUsage = (ex) => c.reply(`⚠️ Contoh: \`.${cmd} ${ex}\``);
   try {
+    if (cmd === 'laporkanerror' || cmd === 'reporterror' || cmd === 'lapor') {
+      const text = String(param || '').trim();
+      if (text.length < 5) return done(c.reply('⚠️ Contoh: `.laporkanerror .bijak tidak membalas`\nTulis keluhan minimal 5 huruf.'));
+      if (text.length > 800) return done(c.reply('⚠️ Laporan terlalu panjang (maks 800 karakter).'));
+      if (Date.now() - (reportCooldown.get(c.senderNum) || 0) < 60000) return done(c.reply('⏳ Tunggu 1 menit sebelum mengirim laporan lagi.'));
+      const ownerId = String(process.env.OWNER_NUMBER || process.env.PHONE_NUMBER || '').split(/[,\s]+/)[0].replace(/\D/g, '')
+        || String(process.env.OWNER_LID || '').split(/[,\s]+/)[0].replace(/\D/g, '');
+      if (!ownerId) return done(c.reply('❌ Nomor owner belum diatur di server.'));
+      reportCooldown.set(c.senderNum, Date.now());
+      const wib = new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' });
+      const repairs = (c.dbMemory?.healthReport?.autoRepairs || []).slice(0, 3).map((r) => `• ${r.time} ${r.mod}: ${r.err}`).join('\n') || '-';
+      const body = `🚨 *LAPORAN ERROR*\n\n👤 +${c.senderNum}\n💬 ${c.isGroup ? 'Grup ' + c.jid : 'Chat pribadi'}\n🕐 ${wib} WIB\n\n📝 ${text}\n\n🩺 *Error terakhir bot:*\n${repairs}\n\n_Tempel laporan ini ke Claude untuk diperiksa._`;
+      try { await c.sock.sendMessage(`${ownerId}@s.whatsapp.net`, { text: body }); } catch { return done(c.reply('❌ Laporan gagal dikirim ke owner. Coba lagi nanti.')); }
+      return done(c.reply('✅ Laporan terkirim ke owner. Terima kasih!'));
+    }
     if (cmd === 'nyerah') {
       const s = quizzes.get(c.jid);
       if (!s) return true;
