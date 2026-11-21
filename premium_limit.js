@@ -442,7 +442,7 @@ export async function handlePremiumCommand({ sock, jid, senderNum, isOwner, isSe
 
   if ((cmd === 'accprem' || cmd === 'addprem') && isOwner) {
     if (/^PREM-/i.test(param)) {
-      const inv = await settleInvoice(dbMemory, saveMemory, param.split(/\s+/)[0], 'Verifikasi Owner', { quoted: msg }).catch(() => null);
+      const inv = await settleInvoice(dbMemory, saveMemory, param.split(/\s+/)[0].toUpperCase(), 'Verifikasi Owner', { quoted: msg }).catch(() => null);
       await send(inv ? `✅ +${inv.phone} aktif VIP ${inv.days} hari.` : '❌ Invoice tidak ditemukan / sudah diproses.');
       return true;
     }
