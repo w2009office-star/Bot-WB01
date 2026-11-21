@@ -5,6 +5,7 @@ import path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { downloadContentFromMessage } from '@whiskeysockets/baileys';
+import { nazeTikTok, nazeYouTube, nazeSocial, askNaze } from './naze_api.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -450,6 +451,8 @@ export async function downloadTikTok(url) {
       if (attempt === 0) await sleep(500);
     }
   }
+  const nz = await nazeTikTok(url).catch(() => null);
+  if (nz) return nz;
   const y = await ytdlp(url);
   return y?.buffer ? { type: 'video', title: y.title, author: '', videoBuffer: y.buffer, musicUrl: '' } : null;
 }
@@ -521,6 +524,12 @@ export async function downloadYouTube(url, audioOnly = false, { height = 720 } =
       return f.buffer.length > 1024 ? { buffer: f.buffer, title: r?.data?.title || r?.result?.title || 'YouTube Media', ext: audioOnly ? 'mp3' : 'mp4' } : null;
     },
     async () => {
+      const n = await nazeYouTube(url, audioOnly, height);
+      if (!n?.url) return null;
+      const f = await fetchFile(n.url, '', { rejectHtml: true });
+      return f.buffer.length > 1024 ? { buffer: f.buffer, title: n.title || 'YouTube Media', ext: audioOnly ? 'mp3' : 'mp4' } : null;
+    },
+    async () => {
       const c = await cobaltResolve(url, { audio: audioOnly, height });
       if (!c?.url) return null;
       const f = await fetchFile(c.url, '', { rejectHtml: true });
@@ -540,6 +549,7 @@ export async function downloadSocialMedia(url, platform = '') {
     if (id) items = [{ type: 'document', url: `https://drive.usercontent.google.com/download?id=${id}&export=download&confirm=t`, fileName: `gdrive_${id}`, rejectHtml: true }];
   } else if (p === 'mediafire') {
     items = await raceFirst([
+      () => nazeSocial('mediafire', url),
       async () => {
         const j = await siputzx('mediafire', url);
         const f = Array.isArray(j?.data) ? j.data[0] : (j?.data || j?.result);
@@ -557,6 +567,7 @@ export async function downloadSocialMedia(url, platform = '') {
   } else {
     const apiName = { igdl: 'igdl', fb: 'facebook', twitter: 'twitter' }[p];
     items = await raceFirst([
+      () => nazeSocial(p, url),
       async () => {
         if (!apiName) return null;
         const j = await siputzx(apiName, url);
@@ -933,6 +944,8 @@ export async function sendNativeInteractiveButtons(sock, jid, payload, quoted) {
 }
 
 export async function panggilServerAISatSet(prompt, systemInstruction = 'Jawab singkat dan akurat dalam Bahasa Indonesia.') {
+  const viaApi = await askNaze(prompt, systemInstruction);
+  if (viaApi) return viaApi;
   try {
     const res = await fetchWithTimeout(`https://text.pollinations.ai/${encodeURIComponent(`${systemInstruction}\n\nPertanyaan: ${prompt}`)}?model=openai`, {
       headers: { 'User-Agent': 'WHUXEN-BOT/1.0' },
