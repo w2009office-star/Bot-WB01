@@ -210,8 +210,26 @@ export async function handleNazeCommand(c, deps) {
       for (const to of targets) {
         try { await c.sock.sendMessage(to, { text: body }); delivered = true; break; } catch (e) { console.error('[laporkanerror] gagal kirim ke', to, e?.message || e); }
       }
-      if (!delivered) { reportCooldown.delete(c.senderNum); return done(c.reply('❌ Laporan gagal dikirim ke owner. Coba lagi nanti.')); }
-      return done(c.reply('✅ Laporan terkirim ke owner. Terima kasih!'));
+      let issueUrl = '';
+      const ghToken = process.env.GITHUB_TOKEN;
+      if (ghToken) {
+        try {
+          const trusted = !!c.isOwner; // hanya laporan owner yang memicu perbaikan otomatis (@claude)
+          const safeText = trusted ? text : text.replace(/@/g, '@\u200b'); // cegah non-owner memicu @claude
+          const ask = trusted ? '@claude Periksa dan perbaiki laporan error bot WhatsApp ini. Baca kode repo, cari penyebabnya, perbaiki seperlunya, jalankan `node --check` pada file .js yang diubah, lalu buka pull request dari branch berawalan `claude/` dengan ringkasan perubahan. Jangan mengubah folder .github/ dan jangan menulis rahasia (API key, token) ke kode.\n\n' : '';
+          const issueBody = `${ask}**Laporan:** ${safeText}\n\n- Pelapor: +${c.senderNum}\n- Waktu: ${wib} WIB\n- Konteks: ${c.isGroup ? 'grup' : 'chat pribadi'}\n\n**Error terakhir bot:**\n${repairs}`;
+          const r = await fetch(`https://api.github.com/repos/${process.env.GITHUB_REPO || 'w2009office-star/Bot-WB01'}/issues`, {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${ghToken}`, Accept: 'application/vnd.github+json', 'Content-Type': 'application/json', 'User-Agent': 'wb01-bot' },
+            body: JSON.stringify({ title: `Laporan: ${safeText.replace(/\s+/g, ' ').slice(0, 70)}`, body: issueBody }),
+            signal: AbortSignal.timeout(15000),
+          });
+          if (r.ok) issueUrl = (await r.json()).html_url || '';
+          else console.error('[laporkanerror] issue gagal, status', r.status);
+        } catch (e) { console.error('[laporkanerror] issue error', e?.message || e); }
+      }
+      if (!delivered && !issueUrl) { reportCooldown.delete(c.senderNum); return done(c.reply('❌ Laporan gagal dikirim ke owner. Coba lagi nanti.')); }
+      return done(c.reply(`✅ Laporan terkirim ke owner. Terima kasih!${issueUrl ? `\n🧾 Issue: ${issueUrl}` : ''}`));
     }
     if (cmd === 'nyerah') {
       const s = quizzes.get(c.jid);
