@@ -1,4 +1,4 @@
-import { fetchWithTimeout, sendNativeInteractiveButtons, panggilServerAISatSet } from './engines.js';
+import { DOWNLOAD_COMMANDS, fetchWithTimeout, sendNativeInteractiveButtons, panggilServerAISatSet } from './engines.js';
 
 export const GROUP_SECURITY_COMMANDS = [
   'antilink', 'antivirtek', 'antibug', 'antitoxic', 'antispam', 'antitagstatus',
@@ -243,7 +243,7 @@ function pruneSpamTracker(now) {
   }
 }
 
-const DL_CMDS = new Set('tiktok tt ttmp3 yt youtube ytmp3 ytmp4 yta ytv play ig instagram igdl fb facebook fbdl twitter tw x capcut mediafire mf gdrive github spotify dl download'.split(' '));
+const DL_CMDS = new Set(DOWNLOAD_COMMANDS);
 const DL_HOSTS = /^(?:[\w-]+\.)*(?:tiktok|capcut|youtube|instagram|facebook|fb|twitter|x|mediafire|github|spotify)\.com$|^(?:youtu\.be|fb\.watch|drive\.google\.com)$/i;
 const LINK_RE = /(https?:\/\/|www\.|chat\.whatsapp\.com|wa\.me\/)/i;
 const LINK_TOKEN = /(?:https?:\/\/|www\.)\S+|(?:chat\.whatsapp\.com|wa\.me)\/\S*/gi;
@@ -262,7 +262,7 @@ const isDownloadRequest = (text, extra = []) => {
 
 function detectViolation({ text, lower, cfg, bot, dbMemory, jid, spamKey }) {
   const count = (re) => (text.match(re) || []).length;
-  if ((cfg.antivirtek || cfg.antibug) && (text.length > 3500 || count(/[\u0300-\u036f]/g) > 25 || count(/[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g) > 40)) return 'virtek';
+  if ((cfg.antivirtek || cfg.antibug) && (text.length > 20000 || count(/[\u0300-\u036f]/g) > 25 || count(/[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g) > 40)) return 'virtek';
   if (cfg.antispam) {
     const now = Date.now();
     const key = `${jid}:${spamKey}`;
