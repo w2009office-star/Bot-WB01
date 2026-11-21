@@ -17,7 +17,8 @@ import { DOWNLOAD_COMMANDS, DOWNLOAD_MENU, handleDownloadCommand, handleDirectUr
 
 const PHONE = (process.env.PHONE_NUMBER || '').replace(/\D/g, '');
 const AUTH_DIR = process.env.AUTH_DIR || './auth';
-const MEMORY_FILE = './memory.json';
+const MEMORY_FILE = process.env.MEMORY_FILE || './memory.json'; // Railway: pasang Volume, mis. MEMORY_FILE=/data/memory.json
+const OWNER = (process.env.OWNER_NUMBER || PHONE).replace(/\D/g, '');
 const OWNER_NAME = process.env.OWNER_NAME || 'Maverick';
 const DAILY_LIMIT = 15; // samakan dengan DAILY_FREE_LIMIT di premium_limit.js
 
@@ -87,7 +88,12 @@ const wib = (opts) => new Intl.DateTimeFormat('id-ID', { timeZone: 'Asia/Jakarta
 const getFullDateTime = () => `${wib({ weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' })} WIB`;
 const getGreeting = () => { const h = Number(wib({ hour: '2-digit', hourCycle: 'h23' })); return h < 11 ? 'pagi' : h < 15 ? 'siang' : h < 18 ? 'sore' : 'malam'; };
 const getTodayDateString = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta' }).format(new Date());
-const saveMemory = () => fsPromises.writeFile(MEMORY_FILE, JSON.stringify(dbMemory, null, 2), 'utf-8').catch(() => {});
+let memoryQueue = Promise.resolve();
+const saveMemory = () => (memoryQueue = memoryQueue.then(async () => {
+  const tmp = `${MEMORY_FILE}.tmp`;
+  await fsPromises.writeFile(tmp, JSON.stringify(dbMemory, null, 2), 'utf-8');
+  await fsPromises.rename(tmp, MEMORY_FILE);
+}).catch((e) => console.error('[memory] gagal simpan:', e?.message)));
 const box = (title, cmds) => `╭─〔 ${title} 〕\n${cmds.map((c) => `│ • .${c}`).join('\n')}\n╰──────────────────`;
 
 function getUptime() {
@@ -113,9 +119,10 @@ const downloadBuffer = async (media, type) => {
 /* ═════════════════════════ MEMORI, AUTO-REPAIR & AUDIT ═════════════════════════ */
 
 async function loadMemory() {
+  const raw = await fsPromises.readFile(MEMORY_FILE, 'utf-8').catch(() => null);
+  if (raw === null) return saveMemory();
   try {
-    if (!fs.existsSync(MEMORY_FILE)) return await saveMemory();
-    const p = JSON.parse(await fsPromises.readFile(MEMORY_FILE, 'utf-8'));
+    const p = JSON.parse(raw);
     Object.assign(dbMemory, {
       ...dbMemory, ...p,
       pendingInvoices: Array.isArray(p.pendingInvoices) ? p.pendingInvoices : [],
@@ -123,7 +130,10 @@ async function loadMemory() {
       healthReport: { ...dbMemory.healthReport, ...(p.healthReport || {}) },
     });
     if (dbMemory.botSettings.customBotName) bot.userName = dbMemory.botSettings.customBotName;
-  } catch { await saveMemory(); }
+  } catch (e) {
+    console.error('[memory] file rusak, salinan disimpan sebagai .corrupt:', e?.message);
+    await fsPromises.writeFile(`${MEMORY_FILE}.corrupt-${Date.now()}`, raw).catch(() => {});
+  }
 }
 
 function recordAutoRepair(mod, err, fix) {
@@ -138,6 +148,7 @@ async function repairSignalSessionForJid(jid = '', reason = 'Signal Reset') {
   try {
     if (!fs.existsSync(AUTH_DIR)) return 0;
     const digits = String(jid).split('@')[0].split(':')[0].replace(/\D/g, '');
+    if (!digits) return 0; // tanpa JID jangan hapus sesi semua kontak
     for (const f of await fsPromises.readdir(AUTH_DIR)) {
       if (f === 'creds.json' || !f.startsWith('session-') || (digits && !f.includes(digits))) continue;
       await fsPromises.unlink(path.join(AUTH_DIR, f)).catch(() => {});
@@ -334,7 +345,7 @@ const sendQrisMenu = (c) => {
   const pkgs = Object.entries(PREMIUM_PACKAGES);
   return sendNativeInteractiveButtons(c.sock, c.jid, {
     title: '💎 QRIS • UPGRADE VIP',
-    body: `╭─〔 PAKET 〕\n${pkgs.map(([k, p]) => `│ ${k}) ${p.label} — ${rp(p.price)}`).join('\n')}\n╰──────────────────\n✅ Limit harian ∞ (Unlimited)\n\nAlur: pilih paket → bayar QRIS DANA → kirim ID transaksi → VIP aktif otomatis.`,
+    body: `╭─〔 PAKET 〕\n${pkgs.map(([k, p]) => `│ ${k}) ${p.label} — ${rp(p.price)}`).join('\n')}\n╰──────────────────\n✅ Limit harian ∞ (Unlimited)\n\nAlur: pilih paket → bayar QRIS DANA → kirim ID transaksi → VIP aktif setelah dicek owner.`,
     footer: 'Ketik .menu untuk kembali',
     buttons: pkgs.map(([k, p]) => ({ text: rp(p.price), id: `qris ${k}` })),
   }, c.msg);
@@ -384,7 +395,8 @@ on(['selftest', 'cekfitur', 'autorepair'], async ({ jid, reply }) => {
 }, { admin: true });
 
 /* ── AI & memori ── */
-on(MENU_CATEGORIES.AI, async ({ cmd, param, reply }) => reply(param ? (await askAI(param, AI_PERSONA())) || '⏳ Server AI sibuk, coba ulangi.' : `⚠️ Contoh: \`.${cmd} jelaskan cara kerja AI\``));
+const CODER = 'Kamu programmer senior. Jawab dengan kode ringkas dan benar dalam blok kode, penjelasan singkat Bahasa Indonesia.';
+on(MENU_CATEGORIES.AI, async ({ cmd, param, reply }) => reply(param ? (await askAI(param, ['kode', 'coding'].includes(cmd) ? CODER : AI_PERSONA())) || '⏳ Server AI sibuk, coba ulangi.' : `⚠️ Contoh: \`.${cmd} jelaskan cara kerja AI\``));
 on('memori', ({ senderNum, reply }) => { const f = dbMemory.users[senderNum]?.facts || []; return reply(f.length ? `🧠 *Ingatan:*\n• ${f.join('\n• ')}` : '🧠 Memori kosong.'); });
 on('resetmemori', async ({ senderNum, reply }) => { if (dbMemory.users[senderNum]) dbMemory.users[senderNum].facts = []; await saveMemory(); return reply('✅ Memori direset.'); });
 
@@ -547,7 +559,7 @@ async function prosesSatuPesan(sock, msg) {
     const senderNum = numOf(msg.key.participantAlt || rawParticipant);
     const altNum = numOf(rawParticipant);
     const pushName = msg.pushName || 'Member';
-    const isOwner = Boolean(PHONE && (senderNum === PHONE || altNum === PHONE));
+    const isOwner = Boolean(OWNER && (senderNum === OWNER || altNum === OWNER));
     if (dbMemory.botSettings.mode === 'self' && !isOwner) return;
 
     const unwrapped = unwrapMessageContent(msg.message);
@@ -607,7 +619,7 @@ async function prosesSatuPesan(sock, msg) {
       const cc = { ...c, cmd, param, args };
       if (await handleMenuCommand(cc)) return;
       if (await handlePremiumCommand({ sock, jid, senderNum, isOwner, isSenderAdmin, cmd, param, msg, dbMemory, saveMemory })) return;
-      if (await handleGroupCommand({ sock, jid, isGroup, senderParticipant: rawParticipant, senderNum, isOwner, isSenderAdmin, cmd, param, unwrapped, msg, dbMemory, saveMemory })) return;
+      if (!(cmd === 'kode' && !isGroup) && await handleGroupCommand({ sock, jid, isGroup, senderParticipant: rawParticipant, senderNum, isOwner, isSenderAdmin, cmd, param, unwrapped, msg, dbMemory, saveMemory })) return;
       if (await handleDownloadCommand({ sock, jid, cmd, param, msg })) return;
       if (await handleGameCommand(cc)) return;
       if (await runCommand(cc)) return;
@@ -636,7 +648,7 @@ let isReconnecting = false;
 function scheduleReconnect(delayMs = 3000) {
   if (isReconnecting) return;
   isReconnecting = true;
-  setTimeout(() => { isReconnecting = false; start().catch(() => {}); }, delayMs);
+  setTimeout(() => { isReconnecting = false; start().catch(() => scheduleReconnect(10000)); }, delayMs);
 }
 
 async function start() {
@@ -733,4 +745,4 @@ mulaiWeb({
     return bot.sock?.requestPairingCode(PHONE).then((code) => { bot.pairingCode = code?.match(/.{1,4}/g)?.join('-') || code; }).catch(() => {});
   },
 });
-start();
+start().catch(() => scheduleReconnect(10000));
