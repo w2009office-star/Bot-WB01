@@ -11,6 +11,7 @@ import { restoreAuthFromGitHub, scheduleAuthBackupToGitHub, startGitHubLiveHotRe
 import { ALL_GROUP_COMMANDS, GROUP_AUTO_ONLY_COMMANDS, GROUP_SECURITY_MENU, isSenderGroupAdmin, handleGroupMessageGuard, handleGroupCommand, handleGroupParticipantsUpdate, handleGroupJoinRequestEvent, startGroupAutomationScheduler, handleGroupThemeInteraction } from './group_automation.js';
 import { PREMIUM_COMMANDS, PREMIUM_PACKAGES, LIMIT_EXEMPT_COMMANDS, ensureUserRecord, isUserPremium, formatRemainingTime, checkAndConsumeDailyLimit, handlePremiumCommand, startPremiumAndQrisWatcher, handlePremiumProofText } from './premium_limit.js';
 import { GAME_COMMANDS, handleGameInput, handleGameCommand } from './handler.js';
+import { NAZE_COMMANDS, handleNazeCommand, handleNazeQuizInput } from './naze_api.js';
 import { DOWNLOAD_COMMANDS, DOWNLOAD_MENU, handleDownloadCommand, handleDirectUrlAutoDownload, fetchWithTimeout, fetchBuffer, extractUrl, mediaBufferToWebpSticker, createBratSticker, urlOrTextToWebpSticker, extractAndDownloadViewOnce, sendNativeInteractiveButtons, panggilServerAISatSet, getAnimeImageUrl } from './engines.js';
 
 /* ═════════════════════════ KONFIGURASI & STATE ═════════════════════════ */
@@ -76,6 +77,15 @@ const SUB_MENU = { groupmenu: 'security', aimenu: 'ai', searchmenu: 'search', an
 
 const ALL_COMMANDS_SET = new Set([...Object.values(MENU_CATEGORIES).flat(), ...DOWNLOAD_COMMANDS, ...ALL_GROUP_COMMANDS, ...PREMIUM_COMMANDS]);
 
+// Perintah API naze.dev/Neosantara: wajib pakai titik (tidak ikut daftar tanpa-titik), menu: .apimenu
+const NAZE_NAMES = NAZE_COMMANDS.filter((n) => !ALL_COMMANDS_SET.has(n));
+const NAZE_SET = new Set(NAZE_NAMES);
+SUB_MENU.apimenu = 'naze';
+MENU_GROUPS.push({ id: 'naze', icon: '🌐', title: 'API Naze & Neosantara', cmds: NAZE_NAMES });
+MENU_CATEGORIES.SYSTEM.push('apimenu');
+ALL_COMMANDS_SET.add('apimenu');
+LIMIT_EXEMPT_COMMANDS.add('apimenu');
+
 /* ═════════════════════════ UTIL UMUM ═════════════════════════ */
 
 const rand = (n) => Math.floor(Math.random() * n);
@@ -110,6 +120,10 @@ function getServerHardwareStats() {
   return { ramPercent, ramBar: bar(ramPercent), diskPercent, diskBar: bar(diskPercent) };
 }
 
+const imageOf = async (c) => {
+  const img = c.unwrapped.imageMessage || unwrapMessageContent(c.unwrapped.extendedTextMessage?.contextInfo?.quotedMessage).imageMessage;
+  return img ? downloadBuffer(img, 'image') : null;
+};
 const downloadBuffer = async (media, type) => {
   const chunks = [];
   for await (const ch of await downloadContentFromMessage(media, type)) chunks.push(ch);
@@ -579,6 +593,7 @@ async function prosesSatuPesan(sock, msg) {
     if (!/^[.!/#]/.test(rawText) && await handlePremiumProofText({ sock, jid, senderNum, text: rawText, msg, dbMemory, saveMemory })) return;
 
     if (await handleGameInput(c)) return;
+    if (await handleNazeQuizInput(c)) return;
 
     const locMatch = rawText.match(/^(?:lokasi(?:ku| saya)?|domisili|kota(?:ku)?)\s+(?:di\s+)?([a-zA-Z\s]{3,35})$/i);
     if (locMatch) {
@@ -623,6 +638,12 @@ async function prosesSatuPesan(sock, msg) {
       if (await handleDownloadCommand({ sock, jid, cmd, param, msg })) return;
       if (await handleGameCommand(cc)) return;
       if (await runCommand(cc)) return;
+    }
+
+    if (/^[.!/#]/.test(rawText) && NAZE_SET.has(cmd)) {
+      if (!(await limit(cmd)).allowed) return;
+      typing();
+      if (await handleNazeCommand({ ...c, cmd, param, args }, { imageOf, toSticker: mediaBufferToWebpSticker })) return;
     }
 
     if (isGroup) {
