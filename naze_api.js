@@ -197,14 +197,20 @@ export async function handleNazeCommand(c, deps) {
       if (text.length < 5) return done(c.reply('⚠️ Contoh: `.laporkanerror .bijak tidak membalas`\nTulis keluhan minimal 5 huruf.'));
       if (text.length > 800) return done(c.reply('⚠️ Laporan terlalu panjang (maks 800 karakter).'));
       if (Date.now() - (reportCooldown.get(c.senderNum) || 0) < 60000) return done(c.reply('⏳ Tunggu 1 menit sebelum mengirim laporan lagi.'));
-      const ownerId = String(process.env.OWNER_NUMBER || process.env.PHONE_NUMBER || '').split(/[,\s]+/)[0].replace(/\D/g, '')
-        || String(process.env.OWNER_LID || '').split(/[,\s]+/)[0].replace(/\D/g, '');
-      if (!ownerId) return done(c.reply('❌ Nomor owner belum diatur di server.'));
+      const firstId = (v) => String(v || '').split(/[,\s]+/)[0].replace(/\D/g, '');
+      const lidId = firstId(process.env.OWNER_LID);
+      const pnId = firstId(process.env.OWNER_NUMBER || process.env.PHONE_NUMBER);
+      const targets = [lidId && `${lidId}@lid`, pnId && `${pnId}@s.whatsapp.net`].filter(Boolean);
+      if (!targets.length) return done(c.reply('❌ Nomor owner belum diatur di server.'));
       reportCooldown.set(c.senderNum, Date.now());
       const wib = new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' });
       const repairs = (c.dbMemory?.healthReport?.autoRepairs || []).slice(0, 3).map((r) => `• ${r.time} ${r.mod}: ${r.err}`).join('\n') || '-';
       const body = `🚨 *LAPORAN ERROR*\n\n👤 +${c.senderNum}\n💬 ${c.isGroup ? 'Grup ' + c.jid : 'Chat pribadi'}\n🕐 ${wib} WIB\n\n📝 ${text}\n\n🩺 *Error terakhir bot:*\n${repairs}\n\n_Tempel laporan ini ke Claude untuk diperiksa._`;
-      try { await c.sock.sendMessage(`${ownerId}@s.whatsapp.net`, { text: body }); } catch { return done(c.reply('❌ Laporan gagal dikirim ke owner. Coba lagi nanti.')); }
+      let delivered = false;
+      for (const to of targets) {
+        try { await c.sock.sendMessage(to, { text: body }); delivered = true; break; } catch (e) { console.error('[laporkanerror] gagal kirim ke', to, e?.message || e); }
+      }
+      if (!delivered) { reportCooldown.delete(c.senderNum); return done(c.reply('❌ Laporan gagal dikirim ke owner. Coba lagi nanti.')); }
       return done(c.reply('✅ Laporan terkirim ke owner. Terima kasih!'));
     }
     if (cmd === 'nyerah') {
