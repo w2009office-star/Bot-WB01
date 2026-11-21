@@ -18,7 +18,7 @@ import { DOWNLOAD_COMMANDS, DOWNLOAD_MENU, handleDownloadCommand, handleDirectUr
 const PHONE = (process.env.PHONE_NUMBER || '').replace(/\D/g, '');
 const AUTH_DIR = process.env.AUTH_DIR || './auth';
 const MEMORY_FILE = process.env.MEMORY_FILE || './memory.json'; // Railway: pasang Volume, mis. MEMORY_FILE=/data/memory.json
-const OWNER = (process.env.OWNER_NUMBER || PHONE).replace(/\D/g, '');
+const OWNERS = new Set(`${process.env.OWNER_NUMBER || PHONE},${process.env.OWNER_LID || ''}`.split(/[,\s]+/).map((n) => n.replace(/\D/g, '')).filter(Boolean)); // OWNER_LID: ID @lid owner jika nomor tidak terbaca
 const OWNER_NAME = process.env.OWNER_NAME || 'Maverick';
 const DAILY_LIMIT = 15; // samakan dengan DAILY_FREE_LIMIT di premium_limit.js
 
@@ -559,7 +559,7 @@ async function prosesSatuPesan(sock, msg) {
     const senderNum = numOf(msg.key.participantAlt || rawParticipant);
     const altNum = numOf(rawParticipant);
     const pushName = msg.pushName || 'Member';
-    const isOwner = Boolean(OWNER && (senderNum === OWNER || altNum === OWNER));
+    const isOwner = [senderNum, altNum, numOf(msg.key.remoteJidAlt || '')].some((n) => OWNERS.has(n));
     if (dbMemory.botSettings.mode === 'self' && !isOwner) return;
 
     const unwrapped = unwrapMessageContent(msg.message);
