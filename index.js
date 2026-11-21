@@ -343,6 +343,15 @@ const sendAllMenu = (c) => sendNativeInteractiveButtons(c.sock, c.jid, {
   buttons: [{ text: '⬅️ Menu Utama', id: 'menu' }, { text: '💎 QRIS • JADI VIP', id: 'qris' }],
 }, c.msg);
 
+const sendFullMenuText = async (c) => {
+  const parts = MENU_GROUPS.map((g) => g.raw || box(`${g.icon} ${g.title}`, g.cmds));
+  let cur = '';
+  for (const p of parts) {
+    if (cur && (cur.length + p.length + 2) > 3500) { await c.reply(cur); cur = p; } else cur = cur ? `${cur}\n\n${p}` : p;
+  }
+  if (cur) await c.reply(cur);
+};
+
 async function sendGroupMenu(c, id) {
   const g = MENU_GROUPS.find((x) => x.id === id);
   if (!g) return sendAllMenu(c);
@@ -368,7 +377,7 @@ const sendQrisMenu = (c) => {
 async function handleMenuCommand(c) {
   const { cmd, param } = c;
   if (cmd === 'menu' || cmd === 'help') await sendMainMenu(c);
-  else if (cmd === 'allmenu') await (param ? sendGroupMenu(c, param.toLowerCase()) : sendAllMenu(c));
+  else if (cmd === 'allmenu') { if (param) await sendGroupMenu(c, param.toLowerCase()); else { await sendFullMenuText(c); await sendAllMenu(c); } }
   else if (SUB_MENU[cmd]) await sendGroupMenu(c, SUB_MENU[cmd]);
   else if (['qris', 'premium', 'belipremium'].includes(cmd) && !param) await sendQrisMenu(c);
   else return false;
