@@ -6,8 +6,10 @@ import path from 'path';
 export const PREMIUM_COMMANDS = ['limit', 'ceklimit', 'premium', 'belipremium', 'qris', 'cekstatus', 'konfirmasi', 'accprem', 'addprem', 'delprem', 'listprem'];
 
 const DAILY_FREE_LIMIT = 15;
-const DANA_NUMBER = process.env.DANA_NUMBER || '085811980122';
+const DANA_NUMBER = process.env.DANA_NUMBER || '';
 const OWNER_NUMBER = (process.env.OWNER_NUMBER || '').replace(/\D/g, '');
+const OWNER_JID = OWNER_NUMBER && `${OWNER_NUMBER}@s.whatsapp.net`;
+const REVIEW_TTL = 24 * 60 * 60 * 1000; // bukti menunggu cek owner maks 24 jam
 const PAKASIR_SLUG = process.env.PAKASIR_SLUG || '';
 const PAKASIR_API_KEY = process.env.PAKASIR_API_KEY || '';
 const WEBHOOK_PORT = Number(process.env.QRIS_WEBHOOK_PORT || 3099);
@@ -324,53 +326,32 @@ const isOldRef = (used, ref) => Object.keys(used).some((r) =>
   r === ref || (Math.min(r.length, ref.length) >= 4 && (r.endsWith(ref) || ref.endsWith(r))));
 
 async function processProof({ sock, jid, senderNum, rawRef, msg, dbMemory, saveMemory }) {
-  const send = (text) => sock.sendMessage(jid, { text }, { quoted: msg });
+  const stop = async (text) => { await sock.sendMessage(jid, { text }, { quoted: msg }); return true; };
   const ref = normRef(rawRef);
   const inv = activeInvoice(dbMemory, senderNum);
 
-  if (!inv) {
-    await send('📭 Tidak ada tagihan aktif (berlaku 5 menit sejak dibuat). Ketik `.qris` untuk membuat tagihan baru.');
-    return true;
-  }
-  if (!ref || !/\d/.test(ref)) {
-    await send(`⚠️ ID tidak terbaca. Kirim ID Transaksi DANA persis seperti di aplikasi.\n\n${HOW_TO_ID}`);
-    return true;
-  }
-  if (inv.tries >= MAX_TRIES) {
-    await send('⛔ Percobaan habis. Buat tagihan baru dengan `.qris`.');
-    return true;
-  }
+  if (!inv) return stop('📭 Tidak ada tagihan aktif (berlaku 5 menit sejak dibuat). Ketik `.qris` untuk membuat tagihan baru.');
+  if (inv.pending) return stop('⏳ Bukti Anda sudah diterima dan sedang dicek owner. Mohon tunggu.');
+  if (!OWNER_JID) return stop('⚠️ Verifikasi pembayaran belum aktif (owner belum diatur). Hubungi owner.');
+  if (!ref || !/\d/.test(ref)) return stop(`⚠️ ID tidak terbaca. Kirim ID Transaksi DANA persis seperti di aplikasi.\n\n${HOW_TO_ID}`);
+  if (inv.tries >= MAX_TRIES) return stop('⛔ Percobaan habis. Buat tagihan baru dengan `.qris`.');
 
   dbMemory.usedRefs ||= {};
   if (isOldRef(dbMemory.usedRefs, ref)) {
     inv.tries += 1;
     await saveMemory();
-    await send(`⛔ ID ini sudah pernah dipakai (bukan bukti terbaru). Sisa percobaan: ${MAX_TRIES - inv.tries}\n\n${HOW_TO_ID}`);
-    return true;
+    return stop(`⛔ ID ini sudah pernah dipakai (bukan bukti terbaru). Sisa percobaan: ${MAX_TRIES - inv.tries}\n\n${HOW_TO_ID}`);
   }
 
   dbMemory.usedRefs[ref] = { orderId: inv.orderId, phone: senderNum, at: Date.now() };
-  let done = null;
-  try {
-    done = await settleInvoice(dbMemory, saveMemory, inv.orderId, 'ID Transaksi DANA', { quoted: msg, ref, pushName: msg?.pushName });
-  } catch (e) {
-    console.error('[premium] gagal aktivasi:', e?.message);
-  }
-  if (!done) {
-    delete dbMemory.usedRefs[ref];
-    await send('❌ Gagal memproses, silakan kirim ulang ID Anda.');
-    return true;
-  }
+  Object.assign(inv, { pending: true, ref, expiresAt: Date.now() + REVIEW_TTL });
   await saveMemory();
-
-  if (OWNER_NUMBER) {
-    await sock.sendMessage(`${OWNER_NUMBER}@s.whatsapp.net`, {
-      text:
-        `🔔 *VIP AKTIF OTOMATIS*\n+${senderNum}\nNominal: ${rp(done.amount)}\nPaket: ${done.days} hari\nID DANA: ${ref}\n\n` +
-        `Cocokkan dengan mutasi DANA. Jika palsu:\n\`.delprem ${senderNum}\``,
-    }).catch(() => {});
-  }
-  return true;
+  await sock.sendMessage(OWNER_JID, {
+    text:
+      `🔔 *BUKTI BAYAR MASUK — CEK MUTASI DANA*\n+${senderNum}\nNominal: ${rp(inv.amount)}\nPaket: ${inv.days} hari\nID DANA: ${ref}\n\n` +
+      `Jika cocok:\n\`.accprem ${inv.orderId}\``,
+  }).catch((e) => console.error('[premium] gagal notif owner:', e?.message));
+  return stop('✅ Bukti diterima. VIP aktif setelah owner memverifikasi pembayaran.');
 }
 
 /**
@@ -426,15 +407,16 @@ export async function handlePremiumCommand({ sock, jid, senderNum, isOwner, isSe
       );
       return true;
     }
+    if (activeInvoice(dbMemory, senderNum)?.pending) { await send('⏳ Bukti pembayaran Anda sedang dicek owner. Mohon tunggu sebelum membuat tagihan baru.'); return true; }
     const { invoice, qrImage } = await createQrisInvoice(dbMemory, saveMemory, senderNum, jid, pkg);
     const caption =
       `💳 *PEMBAYARAN VIP (${pkg.label})*\n\n` +
       `• ID Invoice: \`${invoice.orderId}\`\n` +
       `• Total Bayar: *${rp(invoice.amount)}*\n` +
       (invoice.manual
-        ? `• Bayar lewat QR di atas *(khusus DANA)* atau transfer ke DANA *${DANA_NUMBER}*\n\n` +
+        ? `• Bayar lewat QR di atas *(khusus DANA)*${DANA_NUMBER ? ` atau transfer ke DANA *${DANA_NUMBER}*` : ''}\n\n` +
           `Setelah bayar, langsung kirim *ID Transaksi* DANA ke chat ini (boleh tanpa perintah), atau:\n\`.konfirmasi <ID Transaksi>\`\n\n${HOW_TO_ID}\n\n` +
-          `✅ VIP aktif *otomatis* setelah ID diterima.\n⏱️ Tagihan berlaku *5 menit* (sampai ${fmtWib(invoice.expiresAt)} WIB).`
+          `✅ VIP aktif setelah *dicek owner*.\n⏱️ Tagihan berlaku *5 menit* (sampai ${fmtWib(invoice.expiresAt)} WIB).`
         : `\n✅ VIP aktif *otomatis* setelah pembayaran terverifikasi (±1 menit).\n⏱️ Tagihan berlaku *5 menit*.`);
     await sock.sendMessage(jid, qrImage ? { image: qrImage.buffer || { url: qrImage.url }, caption } : { text: caption }, { quoted: msg });
     return true;
@@ -450,9 +432,11 @@ export async function handlePremiumCommand({ sock, jid, senderNum, isOwner, isSe
       return true;
     }
     const inv = activeInvoice(dbMemory, senderNum);
-    await send(inv
-      ? `⏳ Tagihan \`${inv.orderId}\` *${rp(inv.amount)}* (${inv.days} hari) menunggu pembayaran.\nKirim ID Transaksi setelah bayar. Berlaku sampai ${fmtWib(inv.expiresAt)} WIB.`
-      : '📭 Tidak ada tagihan aktif. Ketik `.qris` untuk melihat paket.');
+    await send(!inv
+      ? '📭 Tidak ada tagihan aktif. Ketik `.qris` untuk melihat paket.'
+      : inv.pending
+        ? `⏳ Bukti untuk tagihan \`${inv.orderId}\` sedang dicek owner. Mohon tunggu.`
+        : `⏳ Tagihan \`${inv.orderId}\` *${rp(inv.amount)}* (${inv.days} hari) menunggu pembayaran.\nKirim ID Transaksi setelah bayar. Berlaku sampai ${fmtWib(inv.expiresAt)} WIB.`);
     return true;
   }
 
