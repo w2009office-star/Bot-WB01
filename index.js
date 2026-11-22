@@ -330,7 +330,7 @@ async function sendMainMenu(c) {
     title: `🤖 ${bot.userName} • MENU UTAMA`,
     body,
     footer: 'Ketik .qris untuk upgrade VVIP Unlimited',
-    buttons: [{ text: '📋 ALLMENU', id: 'allmenu' }, { text: '💎 QRIS • JADI VIP', id: 'qris' }],
+    buttons: [{ text: '📋 ALLMENU', id: 'allmenu' }, { text: '💎 QRIS • JADI VIP', id: 'qris' }, { text: '🚨 LAPORKAN ERROR', id: '.laporkanerror' }],
   }, c.msg);
 }
 
