@@ -931,12 +931,13 @@ export async function sendNativeInteractiveButtons(sock, jid, payload, quoted) {
         },
       },
     }, { quoted });
-  } catch {
+  } catch (e) {
+    console.error('[tombol] kirim pesan interaktif gagal, pakai teks:', e?.message || e);
     const lines = (rows) => rows.join('\n');
     const fallback = [
       title && `*${title}*`, body,
-      lines(sections.flatMap((s) => s.rows || []).map((r) => `• \`.${r.id}\` — ${r.title}`)),
-      lines(buttons.map((b) => `• \`.${b.id}\` — ${b.text}`)),
+      lines(sections.flatMap((s) => s.rows || []).map((r) => `• \`.${String(r.id).replace(/^\./, '')}\` — ${r.title}`)),
+      lines(buttons.map((b) => `• \`.${String(b.id).replace(/^\./, '')}\` — ${b.text}`)),
       footer && `_${footer}_`,
     ].filter(Boolean).join('\n\n');
     await sock.sendMessage(jid, { text: fallback }, { quoted });
