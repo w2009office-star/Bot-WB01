@@ -4,7 +4,7 @@ import os from 'os';
 import path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import { downloadContentFromMessage } from '@whiskeysockets/baileys';
+import { downloadContentFromMessage, generateWAMessageFromContent, proto } from '@whiskeysockets/baileys';
 import { nazeTikTok, nazeYouTube, nazeSocial, askNaze } from './naze_api.js';
 
 const execFileAsync = promisify(execFile);
@@ -919,18 +919,20 @@ export async function sendNativeInteractiveButtons(sock, jid, payload, quoted) {
       ...(sections.length ? [{ name: 'single_select', buttonParamsJson: JSON.stringify({ title: listTitle, sections }) }] : []),
       ...buttons.map((b) => ({ name: 'quick_reply', buttonParamsJson: JSON.stringify({ display_text: b.text, id: b.id }) })),
     ];
-    await sock.sendMessage(jid, {
-      viewOnceMessage: {
-        message: {
-          interactiveMessage: {
-            header: title ? { title, hasMediaAttachment: false } : undefined,
-            body: { text: body },
-            footer: footer ? { text: footer } : undefined,
-            nativeFlowMessage: { buttons: nativeButtons },
-          },
-        },
-      },
-    }, { quoted });
+    const IM = proto.Message.InteractiveMessage;
+    const interactive = IM.create({
+      header: title ? IM.Header.create({ title, hasMediaAttachment: false }) : undefined,
+      body: IM.Body.create({ text: body }),
+      footer: footer ? IM.Footer.create({ text: footer }) : undefined,
+      nativeFlowMessage: IM.NativeFlowMessage.create({ buttons: nativeButtons }),
+    });
+    const waMsg = generateWAMessageFromContent(jid, {
+      viewOnceMessage: { message: { messageContextInfo: { deviceListMetadata: {}, deviceListMetadataVersion: 2 }, interactiveMessage: interactive } },
+    }, { quoted, userJid: sock.user?.id });
+    await sock.relayMessage(jid, waMsg.message, {
+      messageId: waMsg.key.id,
+      additionalNodes: [{ tag: 'biz', attrs: {}, content: [{ tag: 'interactive', attrs: { type: 'native_flow', v: '1' }, content: [{ tag: 'native_flow', attrs: { v: '9', name: 'mixed' } }] }] }],
+    });
   } catch (e) {
     console.error('[tombol] kirim pesan interaktif gagal, pakai teks:', e?.message || e);
     const lines = (rows) => rows.join('\n');
