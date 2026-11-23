@@ -114,6 +114,11 @@ const saveMemory = () => (memoryQueue = memoryQueue.then(async () => {
 // Tipografi seragam: judul tebal + jumlah miring, perintah monospace sebaris (otomatis turun baris di layar kecil)
 const DIV = '┈┈┈┈┈┈┈┈┈┈';
 const box = (title, cmds) => `*${title}* _(${cmds.length})_\n${cmds.map((c) => `\`.${c}\``).join('  ')}`;
+// Ubah menu lama berbingkai (╭┈─〔 ... 〕) jadi gaya seragam: judul tebal + kutipan, tanpa garis panjang
+const prettify = (t) => String(t)
+  .replace(/^\*╭[^\n]*?〔\s*(.*?)\s*〕[^\n]*\*$/gm, '*$1*')
+  .replace(/^\*╰[^\n]*\*\n?/gm, '')
+  .replace(/^\*│\*\s?/gm, '> ');
 
 function getUptime() {
   const s = Math.floor((Date.now() - bot.startTime) / 1000);
@@ -351,7 +356,19 @@ const sendAllMenu = (c) => sendNativeInteractiveButtons(c.sock, c.jid, {
   buttons: [{ text: '⬅️ Menu Utama', id: 'menu' }, { text: '💎 QRIS • JADI VIP', id: 'qris' }],
 }, c.msg);
 
-const sendFullMenuText = (c) => c.reply(`${MENU_GROUPS.map((g) => g.raw || box(`${g.icon} ${g.title}`, g.cmds)).join(`\n\n${DIV}\n\n`)}\n\n_Detail perintah: .help <perintah> • Upgrade: .qris_`);
+// Allmenu satu pesan: kepala ringkas, lalu tiap kelompok dipisah garis pendek
+const sendFullMenuText = (c) => {
+  const head = [
+    `*✦ ${bot.userName} ✦*`,
+    '_Daftar lengkap fitur_',
+    '',
+    `> ${ALL_COMMANDS_SET.size} fitur • ${MENU_GROUPS.length} kelompok`,
+    `> Owner: ${OWNER_NAME}`,
+    '> Detail perintah: *.help <perintah>*',
+  ].join('\n');
+  const groups = MENU_GROUPS.map((g) => (g.raw ? prettify(g.raw) : box(`${g.icon} ${g.title.toUpperCase()}`, g.cmds)));
+  return c.reply(`${head}\n\n${DIV}\n\n${groups.join(`\n\n${DIV}\n\n`)}\n\n${DIV}\n_Kembali: .menu • Upgrade VVIP: .qris_`);
+};
 
 // Bantuan per perintah: kelompok, contoh pemakaian (jika ada), dan baris deskripsi dari menu
 async function sendHelpFor(c, raw) {
@@ -375,7 +392,7 @@ async function sendHelpFor(c, raw) {
 async function sendGroupMenu(c, id) {
   const g = MENU_GROUPS.find((x) => x.id === id);
   if (!g) return sendAllMenu(c);
-  const body = g.raw || box(g.title, g.cmds);
+  const body = g.raw ? prettify(g.raw) : box(g.title, g.cmds);
   if (body.length > 1000) return c.reply(`*${g.icon} ${g.title.toUpperCase()}*\n\n${body}\n\n_Ketik .allmenu untuk kembali • .qris untuk VVIP_`);
   return sendNativeInteractiveButtons(c.sock, c.jid, {
     title: `${g.icon} ${g.title.toUpperCase()}`,
