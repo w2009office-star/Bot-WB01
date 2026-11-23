@@ -14,6 +14,13 @@ import { GAME_COMMANDS, handleGameInput, handleGameCommand } from './handler.js'
 import { NAZE_COMMANDS, handleNazeCommand, handleNazeQuizInput } from './naze_api.js';
 import { DOWNLOAD_COMMANDS, DOWNLOAD_MENU, handleDownloadCommand, handleDirectUrlAutoDownload, fetchWithTimeout, fetchBuffer, extractUrl, mediaBufferToWebpSticker, createBratSticker, urlOrTextToWebpSticker, extractAndDownloadViewOnce, sendNativeInteractiveButtons, panggilServerAISatSet, getAnimeImageUrl } from './engines.js';
 
+// --- filter log sesi Signal (berisi kunci privat) ---
+const _noisy = /^(Closing session|Opening session|Removing old closed session|Migrating session|Session already (closed|open))/;
+for (const lvl of ['log', 'info', 'warn']) {
+  const orig = console[lvl].bind(console);
+  console[lvl] = (...a) => { if (typeof a[0] === 'string' && _noisy.test(a[0])) return; orig(...a); };
+}
+
 /* ═════════════════════════ KONFIGURASI & STATE ═════════════════════════ */
 
 const PHONE = (process.env.PHONE_NUMBER || '').replace(/\D/g, '');
@@ -53,7 +60,7 @@ const MENU_CATEGORIES = {
   STICKER_LOGO: ['sticker', 'stiker', 's', 'brat', 'bratvid', 'bratvideo', 'ttp', 'attp', 'qc', 'animasi', 'linkvideo', 'font', 'fancy', 'logo', 'neon', 'gold', 'galaxy', 'glitch', 'matrix', 'graffiti', 'thunder'],
   TOOLS: ['rvo', 'rvop', 'vv', 'hitung', 'catat', 'catatan', 'terjemah', 'translate', 'id', 'getpp', 'getbio', 'gpass', 'qr', 'shorturl', 'waktu', 'base64', 'reverse', 'ssweb', 'fixsession'],
   OWNER: ['setnama', 'setname', 'botname', 'updatebio', 'block', 'unblock', 'blocklist', 'autoread', 'autotyping', 'mode', 'badwords', 'addkata', 'delkata', 'clean'],
-  SYSTEM: ['menu', 'help', 'allmenu', 'groupmenu', 'aimenu', 'downloadmenu', 'dlmenu', 'searchmenu', 'animemenu', 'funmenu', 'logomenu', 'toolsmenu', 'ownermenu', 'ping', 'ping2', 'speed', 'os', 'alive', 'runtime', 'uptime', 'owner', 'status', 'selftest', 'cekfitur', 'autorepair', 'update'],
+  SYSTEM: ['menu', 'help', 'allmenu', 'groupmenu', 'aimenu', 'downloadmenu', 'dlmenu', 'searchmenu', 'animemenu', 'funmenu', 'logomenu', 'toolsmenu', 'ownermenu', 'ping', 'ping2', 'speed', 'os', 'alive', 'runtime', 'uptime', 'owner', 'status', 'selftest', 'statusbot', 'cekfitur', 'autorepair', 'update'],
 };
 
 // Kelompok di ALLMENU: `cmds` → 1 perintah 1 baris, `raw` → teks menu bawaan modul (juga 1 perintah 1 baris)
@@ -104,7 +111,9 @@ const saveMemory = () => (memoryQueue = memoryQueue.then(async () => {
   await fsPromises.writeFile(tmp, JSON.stringify(dbMemory, null, 2), 'utf-8');
   await fsPromises.rename(tmp, MEMORY_FILE);
 }).catch((e) => console.error('[memory] gagal simpan:', e?.message)));
-const box = (title, cmds) => `╭─〔 ${title} 〕\n${cmds.map((c) => `│ • .${c}`).join('\n')}\n╰──────────────────`;
+// Tipografi seragam: judul tebal + jumlah miring, perintah monospace sebaris (otomatis turun baris di layar kecil)
+const DIV = '┈┈┈┈┈┈┈┈┈┈';
+const box = (title, cmds) => `*${title}* _(${cmds.length})_\n${cmds.map((c) => `\`.${c}\``).join('  ')}`;
 
 function getUptime() {
   const s = Math.floor((Date.now() - bot.startTime) / 1000);
@@ -311,19 +320,18 @@ async function sendMainMenu(c) {
   const rec = ensureUserRecord(dbMemory, c.senderNum);
   const u = getUserInfo(c, rec);
   const body = [
-    `🗓️ ${getFullDateTime()}`,
+    `🗓️ _${getFullDateTime()}_`,
     '',
     `👋 Selamat ${getGreeting()}, *${c.pushName}*!`,
-    'Silakan pilih menu di bawah.',
+    'Pilih lewat tombol, atau ketik perintah. Bantuan: *.help <perintah>*',
     '',
-    '╭─〔 👤 INFO USER 〕',
-    `│ Nama    : ${c.pushName}`,
-    `│ Status  : ${u.label}`,
-    `│ Limit   : ${u.limit}`,
-    `│ VVIP    : ${u.vip}`,
-    `│ Lokasi  : ${rec.city || 'Belum diset (ketik: lokasi di bandung)'}`,
-    `│ Version : v${dbMemory.version}`,
-    '╰──────────────────',
+    '*👤 INFO PENGGUNA*',
+    `> Nama: ${c.pushName}`,
+    `> Status: ${u.label}`,
+    `> Limit: ${u.limit}`,
+    `> VVIP: ${u.vip}`,
+    `> Lokasi: ${rec.city || 'Belum diset (ketik: lokasi di bandung)'}`,
+    `> Versi: v${dbMemory.version}`,
   ].join('\n');
   lastReplyTextByJid.set(c.jid, body);
   await sendNativeInteractiveButtons(c.sock, c.jid, {
@@ -343,7 +351,26 @@ const sendAllMenu = (c) => sendNativeInteractiveButtons(c.sock, c.jid, {
   buttons: [{ text: '⬅️ Menu Utama', id: 'menu' }, { text: '💎 QRIS • JADI VIP', id: 'qris' }],
 }, c.msg);
 
-const sendFullMenuText = (c) => c.reply(`${MENU_GROUPS.map((g) => g.raw || box(`${g.icon} ${g.title}`, g.cmds)).join('\n\n')}\n\n_Ketik .qris untuk upgrade VVIP Unlimited_`);
+const sendFullMenuText = (c) => c.reply(`${MENU_GROUPS.map((g) => g.raw || box(`${g.icon} ${g.title}`, g.cmds)).join(`\n\n${DIV}\n\n`)}\n\n_Detail perintah: .help <perintah> • Upgrade: .qris_`);
+
+// Bantuan per perintah: kelompok, contoh pemakaian (jika ada), dan baris deskripsi dari menu
+async function sendHelpFor(c, raw) {
+  const name = String(raw).trim().split(/\s+/)[0].replace(/^[.!/#]/, '').toLowerCase();
+  if (!ALL_COMMANDS_SET.has(name) && !NAZE_SET.has(name)) {
+    return c.reply(`❓ Perintah *.${name}* tidak ditemukan.\nKetik *.allmenu* untuk melihat semua fitur.`);
+  }
+  const g = MENU_GROUPS.find((x) => x.cmds?.includes(name) || x.raw?.includes(`.${name}`));
+  const desc = g?.raw?.split('\n').find((l) => l.includes(`.${name}`));
+  const usage = H.get(name)?.usage;
+  return c.reply([
+    `*📖 BANTUAN • .${name}*`,
+    g ? `> Kelompok: ${g.icon} ${g.title}` : null,
+    usage ? `> Contoh: \`${usage}\`` : null,
+    desc ? `> ${desc.replace(/[*│•`]/g, '').trim()}` : null,
+    '',
+    '_Semua fitur: .allmenu_',
+  ].filter((x) => x !== null).join('\n'));
+}
 
 async function sendGroupMenu(c, id) {
   const g = MENU_GROUPS.find((x) => x.id === id);
@@ -369,7 +396,8 @@ const sendQrisMenu = (c) => {
 
 async function handleMenuCommand(c) {
   const { cmd, param } = c;
-  if (cmd === 'menu' || cmd === 'help') await sendMainMenu(c);
+  if (cmd === 'help' && c.param) await sendHelpFor(c, c.param);
+  else if (cmd === 'menu' || cmd === 'help') await sendMainMenu(c);
   else if (cmd === 'allmenu') { if (param) await sendGroupMenu(c, param.toLowerCase()); else await sendFullMenuText(c); }
   else if (SUB_MENU[cmd]) await sendGroupMenu(c, SUB_MENU[cmd]);
   else if (['qris', 'premium', 'belipremium'].includes(cmd) && !param) await sendQrisMenu(c);
@@ -381,14 +409,60 @@ async function handleMenuCommand(c) {
 // on(nama|[nama], handler, { owner, admin, usage })
 
 const H = new Map();
-const on = (names, fn, opt = {}) => [].concat(names).forEach((n) => H.set(n, { fn, ...opt }));
+// Statistik ringan untuk .statusbot
+const STATS = { cmds: 0, slow: 0, errors: 0, since: Date.now() };
+// Bungkus tiap perintah: hitung pemakaian, catat yang lambat (>3 dtk) dan yang error
+const timed = (n, fn) => async (...a) => {
+  const t0 = Date.now();
+  STATS.cmds++;
+  try { return await fn(...a); } catch (e) { STATS.errors++; throw e; } finally {
+    const d = Date.now() - t0;
+    if (d > 3000) { STATS.slow++; console.log(`[lambat] .${n} ${(d / 1000).toFixed(1)} dtk`); }
+  }
+};
+
+// Cooldown per pengguna (owner dikecualikan): perintah berat 5 dtk, lainnya 1,2 dtk
+const cdLast = new Map();
+const cdNoticeAt = new Map();
+let heavySet = null;
+function cooldownWait(senderNum, cmd) {
+  heavySet ||= new Set([...DOWNLOAD_COMMANDS, ...MENU_CATEGORIES.AI, ...NAZE_SET]);
+  const gap = heavySet.has(cmd) ? 5000 : 1200;
+  const now = Date.now();
+  const wait = (cdLast.get(senderNum) || 0) + gap - now;
+  if (wait > 0) return wait;
+  cdLast.set(senderNum, now);
+  if (cdLast.size > 2000) for (const [k, t] of cdLast) if (now - t > 60000) cdLast.delete(k); // cegah memori membengkak
+  return 0;
+}
+// Beri tahu pengguna maksimal sekali per 10 dtk agar tidak menambah spam
+function cooldownNotice(senderNum, waitMs) {
+  const now = Date.now();
+  if (now - (cdNoticeAt.get(senderNum) || 0) < 10000) return null;
+  cdNoticeAt.set(senderNum, now);
+  if (cdNoticeAt.size > 2000) for (const [k, t] of cdNoticeAt) if (now - t > 60000) cdNoticeAt.delete(k);
+  return `⏳ Pelan-pelan ya, tunggu *${Math.ceil(waitMs / 1000)} detik* lagi.`;
+}
+
+// Pesan error ramah ke pengguna (maks 1x per 30 dtk per chat)
+const errNoticeAt = new Map();
+async function notifyUserError(sock, msg) {
+  const to = msg?.key?.remoteJid;
+  if (!to) return;
+  const now = Date.now();
+  if (now - (errNoticeAt.get(to) || 0) < 30000) return;
+  errNoticeAt.set(to, now);
+  if (errNoticeAt.size > 1000) for (const [k, t] of errNoticeAt) if (now - t > 60000) errNoticeAt.delete(k);
+  try { await sock.sendMessage(to, { text: '⚠️ Maaf, ada kendala saat memproses permintaanmu. Coba lagi sebentar lagi ya.\nJika terus berulang, ketik *.laporkanerror <keluhan>*.' }, { quoted: msg }); } catch {}
+}
+const on = (names, fn, opt = {}) => [].concat(names).forEach((n) => H.set(n, { fn: timed(n, fn), ...opt }));
 const needUrl = (fn) => (c) => { const u = extractUrl(c.param); return u ? fn(c, u) : c.reply(`⚠️ Contoh: \`.${c.cmd} https://...\``); };
 const userOf = (c) => ensureUserRecord(dbMemory, c.senderNum);
 const QUOTED = (c) => c.unwrapped.extendedTextMessage?.contextInfo?.quotedMessage;
 
 const FONT_MAPS = [119737, 119789, 119841, 120003, 120367].map((off) => (t) => t.replace(/[A-Za-z]/g, (ch) => String.fromCodePoint(ch.charCodeAt(0) + (ch <= 'Z' ? off : off - 6))));
 const LOGO = { logo: '0f172a/38bdf8', neon: '090d16/00ffcc', gold: '1c1917/facc15', galaxy: '1e1b4b/c084fc', glitch: '18181b/f43f5e', matrix: '022c22/4ade80', graffiti: '312e81/fb923c', thunder: '0c4a6e/fde047' };
-const AI_PERSONA = () => `Kamu adalah ${bot.userName}. Jawab singkat, cerdas, dan akurat dalam Bahasa Indonesia.`;
+const AI_PERSONA = () => `Kamu adalah ${bot.userName}, bot WhatsApp berbahasa Indonesia. Jawab singkat, jelas, dan akurat. Perintah bot memakai awalan titik (contoh: .menu, .allmenu, .qris). Jangan pernah mengarang daftar perintah atau fitur bot, jangan memakai garis miring (/) sebagai awalan perintah, dan jangan membuat kode untuk bot ini kecuali diminta. Jika ditanya fitur bot, arahkan ke .menu atau .allmenu. Jika tidak tahu, katakan tidak tahu.`;
 
 /* ── Sistem ── */
 on(['ping', 'ping2', 'speed', 'os'], ({ reply }) => {
@@ -485,6 +559,22 @@ on(['terjemah', 'translate'], async ({ param, reply }) => {
   return reply((await askAI(`Terjemahkan ke ${lang}: ${rest.join(' ')}`, 'Terjemahkan saja.')) || '-');
 }, { usage: 'en selamat pagi' });
 on('id', ({ jid, reply }) => reply(`🆔 \`${jid}\``));
+// Ringkasan kesehatan bot untuk owner
+on('statusbot', async ({ isOwner, reply }) => {
+  if (!isOwner) return reply('🔒 Perintah ini khusus owner.');
+  const m = process.memoryUsage();
+  const up = Math.floor(process.uptime());
+  const fmt = (n) => `${(n / 1048576).toFixed(0)} MB`;
+  return reply([
+    '*📊 STATUS BOT*',
+    `> Aktif: ${Math.floor(up / 3600)} jam ${Math.floor((up % 3600) / 60)} menit`,
+    `> Memori: ${fmt(m.rss)} (heap ${fmt(m.heapUsed)})`,
+    `> Perintah diproses: ${STATS.cmds}`,
+    `> Lambat (>3 dtk): ${STATS.slow}`,
+    `> Error perintah: ${STATS.errors}`,
+    `> Node: ${process.version}`,
+  ].join('\n'));
+});
 on('getpp', async ({ sock, rawParticipant, reply, send }) => { const pp = await sock.profilePictureUrl(rawParticipant, 'image').catch(() => null); return pp ? send({ image: { url: pp } }) : reply('❌ Privat.'); });
 on('getbio', async ({ sock, rawParticipant, reply }) => reply(`📝 ${(await sock.fetchStatus(rawParticipant).catch(() => null))?.status || '-'}`));
 on('gpass', ({ reply }) => { const ch = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%'; return reply(`🔐 \`${Array.from({ length: 12 }, () => pick(ch)).join('')}\``); });
@@ -621,6 +711,12 @@ async function prosesSatuPesan(sock, msg) {
     const param = args.slice(1).join(' ').trim();
     const typing = () => { if (dbMemory.botSettings.autotyping) sock.sendPresenceUpdate('composing', jid).catch(() => {}); };
 
+    // Anti-spam per pengguna: tolak perintah yang datang terlalu cepat (owner bebas)
+    if (!isOwner && (ALL_COMMANDS_SET.has(cmd) || (/^[.!/#]/.test(rawText) && NAZE_SET.has(cmd)))) {
+      const w = cooldownWait(senderNum, cmd);
+      if (w > 0) { const note = cooldownNotice(senderNum, w); if (note) await reply(note); return; }
+    }
+
     if (!ALL_COMMANDS_SET.has(cmd)) {
       const directUrl = extractUrl(rawText);
       if (directUrl) {
@@ -654,12 +750,12 @@ async function prosesSatuPesan(sock, msg) {
     }
 
     if (rawText.length < 2 || !(await limit('chat_ai')).allowed) return;
-    const ai = await askAI(rawText, `Kamu adalah ${bot.userName}, asisten WhatsApp cerdas.`);
+    const ai = await askAI(rawText, AI_PERSONA());
     if (ai) await reply(ai);
   } catch (err) {
     const m = err?.message || 'Error';
     if (SIGNAL_ERR.test(m)) await triggerAutoCipherHeal(msg?.key?.remoteJid || '', m);
-    else recordAutoRepair('Handler', m, 'Pesan diisolasi');
+    else { recordAutoRepair('Handler', m, 'Pesan diisolasi'); await notifyUserError(sock, msg); }
   }
 }
 
