@@ -947,18 +947,32 @@ export async function sendNativeInteractiveButtons(sock, jid, payload, quoted) {
 }
 
 export async function panggilServerAISatSet(prompt, systemInstruction = 'Jawab singkat dan akurat dalam Bahasa Indonesia.') {
-  const viaApi = await askNaze(prompt, systemInstruction);
-  if (viaApi) return viaApi;
-  try {
-    const res = await fetchWithTimeout(`https://text.pollinations.ai/${encodeURIComponent(`${systemInstruction}\n\nPertanyaan: ${prompt}`)}?model=openai`, {
-      headers: { 'User-Agent': 'WHUXEN-BOT/1.0' },
-    }, 18000);
-    if (!res.ok) return null;
-    const text = (await res.text()).trim();
-    return text && !/<!doctype|<html/i.test(text) ? text : null;
-  } catch {
-    return null;
-  }
+  // Cadangan Pollinations
+  const pollinations = async () => {
+    try {
+      const res = await fetchWithTimeout(`https://text.pollinations.ai/${encodeURIComponent(`${systemInstruction}\n\nPertanyaan: ${prompt}`)}?model=openai`, {
+        headers: { 'User-Agent': 'WHUXEN-BOT/1.0' },
+      }, 18000);
+      if (!res.ok) return null;
+      const text = (await res.text()).trim();
+      return text && !/<!doctype|<html/i.test(text) ? text : null;
+    } catch {
+      return null;
+    }
+  };
+  // Penyedia utama (Neosantara → naze). Jika belum menjawab dalam 3,5 dtk, cadangan ikut dijalankan paralel
+  // dan jawaban pertama yang berisi yang dipakai (hedged request), jadi tidak menunggu penyedia yang lambat.
+  const primary = askNaze(prompt, systemInstruction).catch(() => null);
+  const early = await Promise.race([primary.then((r) => ({ r })), new Promise((res) => setTimeout(() => res(null), 3500))]);
+  if (early?.r) return early.r;
+  const backup = pollinations();
+  if (early) return backup; // utama sudah selesai tetapi kosong
+  return new Promise((resolve) => {
+    let left = 2;
+    const done = (v) => { if (v) resolve(v); else if (--left === 0) resolve(null); };
+    primary.then(done);
+    backup.then(done);
+  });
 }
 
 export async function getAnimeImageUrl(category = 'waifu') {
@@ -968,4 +982,4 @@ export async function getAnimeImageUrl(category = 'waifu') {
   } catch {
     return null;
   }
-}
+    }
