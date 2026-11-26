@@ -53,14 +53,17 @@ export async function neoChat(model, content, extra = {}) {
 }
 
 /** Tanya AI lewat Neosantara lalu naze /ai/chat2. null jika tidak ada key / gagal. */
+const AI_STEP_MS = 15000; // tiap penyedia AI maks 15 dtk sebelum pindah ke cadangan
 export async function askNaze(prompt, system = '') {
   const attempts = [
-    neoEnabled() && (async () => (await neoChat(NEO_MODEL(), [...(system ? [{ role: 'system', content: system }] : []), { role: 'user', content: prompt }]))?.content),
-    nazeEnabled() && (async () => (await nazeApi('/ai/chat2', { query: system ? `${system}\n\n${prompt}` : prompt }, { ms: 30000 }))?.result?.message),
+    neoEnabled() && (async () => (await neoChat(NEO_MODEL(), [...(system ? [{ role: 'system', content: system }] : []), { role: 'user', content: prompt }], { max_tokens: 400 }))?.content), // batasi panjang jawaban agar lebih cepat
+    nazeEnabled() && (async () => (await nazeApi('/ai/chat2', { query: system ? `${system}\n\n${prompt}` : prompt }, { ms: 15000 }))?.result?.message),
   ].filter(Boolean);
   for (const run of attempts) {
     try {
-      const t = String((await run()) || '').trim();
+      let timer;
+      const limit = new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('AI timeout')), AI_STEP_MS); });
+      const t = String((await Promise.race([run(), limit]).finally(() => clearTimeout(timer))) || '').trim();
       if (t) return t;
     } catch {}
   }
