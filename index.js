@@ -59,7 +59,7 @@ const MENU_CATEGORIES = {
   FUN: GAME_COMMANDS,
   STICKER_LOGO: ['sticker', 'stiker', 's', 'brat', 'bratvid', 'bratvideo', 'ttp', 'attp', 'qc', 'animasi', 'linkvideo', 'font', 'fancy', 'logo', 'neon', 'gold', 'galaxy', 'glitch', 'matrix', 'graffiti', 'thunder'],
   TOOLS: ['rvo', 'rvop', 'vv', 'hitung', 'catat', 'catatan', 'terjemah', 'translate', 'id', 'getpp', 'getbio', 'gpass', 'qr', 'shorturl', 'waktu', 'base64', 'reverse', 'ssweb', 'fixsession'],
-  OWNER: ['sari', 'setnama', 'setname', 'botname', 'updatebio', 'block', 'unblock', 'blocklist', 'autoread', 'autotyping', 'mode', 'badwords', 'addkata', 'delkata', 'clean'],
+  OWNER: ['grupsetuju', 'gruptolak', 'aktifkanbot', 'nonaktifkanbot', 'grupdaftar', 'sari', 'setnama', 'setname', 'botname', 'updatebio', 'block', 'unblock', 'blocklist', 'autoread', 'autotyping', 'mode', 'badwords', 'addkata', 'delkata', 'clean'],
   SYSTEM: ['menu', 'help', 'allmenu', 'groupmenu', 'aimenu', 'downloadmenu', 'dlmenu', 'searchmenu', 'animemenu', 'funmenu', 'logomenu', 'toolsmenu', 'ownermenu', 'ping', 'ping2', 'speed', 'os', 'alive', 'runtime', 'uptime', 'owner', 'status', 'selftest', 'statusbot', 'cekfitur', 'autorepair', 'update'],
 };
 
@@ -465,6 +465,131 @@ async function sariReply(c, userText) {
   return out || null;
 }
 
+
+/* ═════════════ AI GRUP: persetujuan lewat link + anti-culik ═════════════ */
+const GROUP_LINK_RE = /chat\.whatsapp\.com\/([A-Za-z0-9]{18,26})/;
+const aiHist = new Map();      // jid → { t, h: [[peran, teks]] } riwayat singkat untuk AI
+const groupAiAt = new Map();   // jid grup → waktu balasan AI terakhir (throttle)
+const pendingLeave = new Map(); // id permintaan → timer keluar otomatis
+const newId = () => Math.random().toString(36).slice(2, 8);
+const digitsOf = (j) => String(j || '').split(':')[0].split('@')[0].replace(/\D/g, '');
+const store = () => { dbMemory.aiGroups ||= {}; dbMemory.groupReqs ||= {}; return dbMemory; };
+
+// Riwayat percakapan singkat (6 giliran, kedaluwarsa 3 jam) agar AI paham konteks
+function histPrompt(key, who, text) {
+  const now = Date.now();
+  let st = aiHist.get(key);
+  if (!st || now - st.t > 3 * 3600000) st = { t: now, h: [] };
+  st.t = now;
+  const transcript = st.h.map(([r, t]) => `${r}: ${t}`).join('\n');
+  aiHist.set(key, st);
+  if (aiHist.size > 600) for (const [k, v] of aiHist) if (now - v.t > 3 * 3600000) aiHist.delete(k);
+  return { st, prompt: `${transcript ? `${transcript}\n` : ''}${who}: ${String(text).slice(0, 500)}\nBot:` };
+}
+function histPush(st, who, text, out) {
+  st.h.push([who, String(text).slice(0, 300)], ['Bot', String(out).slice(0, 300)]);
+  if (st.h.length > 12) st.h.splice(0, st.h.length - 12);
+}
+
+// Kirim ke owner dengan tombol Setujui / Tolak (jatuh ke teks jika tombol tidak tampil)
+async function askOwnerApproval(sock, id, title, body) {
+  const first = (v) => String(v || '').split(/[,\s]+/)[0].replace(/\D/g, '');
+  const lid = first(process.env.OWNER_LID);
+  const pn = first(process.env.OWNER_NUMBER || PHONE);
+  const payload = { title, body, footer: 'Balas dengan tombol atau ketik perintahnya', buttons: [{ text: '✅ Setujui', id: `.grupsetuju ${id}` }, { text: '❌ Tolak', id: `.gruptolak ${id}` }] };
+  for (const to of [lid && `${lid}@lid`, pn && `${pn}@s.whatsapp.net`].filter(Boolean)) {
+    try { await sendNativeInteractiveButtons(sock, to, payload); return true; } catch (e) { console.error('[grup] gagal kirim persetujuan ke', to, e?.message || e); }
+  }
+  return false;
+}
+
+// Pembeli/anggota mengirim link grup ke chat pribadi bot
+async function handleGroupLinkRequest(c, code) {
+  const { sock, jid, senderNum, pushName, isOwner, reply } = c;
+  const info = await sock.groupGetInviteInfo(code).catch(() => null);
+  if (!info?.id) return reply('❌ Link grup tidak valid atau sudah kedaluwarsa.');
+  const db = store();
+  if (db.aiGroups[info.id]?.ai) return reply(`✅ Bot sudah aktif di grup *${info.subject}*.`);
+  if (isOwner) return approveGroup(sock, { type: 'link', code, gjid: info.id, name: info.subject, byJid: jid }, reply);
+  const mine = Object.values(db.groupReqs).filter((r) => r.by === senderNum).length;
+  if (mine >= 3) return reply('⏳ Permintaan kamu masih menunggu persetujuan owner. Sabar ya.');
+  const id = newId();
+  db.groupReqs[id] = { type: 'link', code, gjid: info.id, name: info.subject, size: info.size, by: senderNum, byName: pushName, byJid: jid, at: Date.now() };
+  const keys = Object.keys(db.groupReqs); if (keys.length > 50) delete db.groupReqs[keys[0]];
+  saveMemory();
+  await askOwnerApproval(sock, id, '📨 PERMINTAAN AKTIFKAN BOT',
+    `> Grup: *${info.subject}*\n> Anggota: ${info.size ?? '-'}\n> Pengaju: ${pushName || '-'} (+${senderNum})\n> ID: ${id}`);
+  return reply(`📨 Permintaan untuk grup *${info.subject}* sudah dikirim ke owner.\nKamu akan diberi kabar setelah diputuskan.`);
+}
+
+// Setujui: bot masuk (jika dari link) dan AI diaktifkan di grup tersebut
+async function approveGroup(sock, req, reply) {
+  const db = store();
+  let gjid = req.gjid;
+  if (req.type === 'link') {
+    try { gjid = (await sock.groupAcceptInvite(req.code)) || gjid; }
+    catch (e) {
+      const m = String(e?.message || e);
+      if (!/already|conflict|409/i.test(m)) { await reply?.(`❌ Gagal masuk grup: ${m.slice(0, 120)}`); return false; }
+    }
+  }
+  db.aiGroups[gjid] = { name: req.name, at: Date.now(), ai: true, by: req.by || 'owner' };
+  await saveMemory();
+  if (req.byJid) await sock.sendMessage(req.byJid, { text: `✅ Disetujui! Bot aktif di grup *${req.name}*.` }).catch(() => {});
+  await sock.sendMessage(gjid, { text: '✅ *Bot aktif di grup ini.* AI akan membalas pesan di sini. Admin bisa menghentikannya dengan *.nonaktifkanbot*.' }).catch(() => {});
+  await reply?.(`✅ Grup *${req.name}* diaktifkan.`);
+  return true;
+}
+
+// Bot ditambahkan ke grup oleh orang lain → tahan sampai owner setuju (anti-culik)
+async function onBotAdded(sock, u) {
+  if (u?.action !== 'add' || !u.id?.endsWith('@g.us')) return;
+  const ids = (u.participants || []).map((p) => digitsOf(typeof p === 'string' ? p : p?.id || p?.phoneNumber));
+  const me = [digitsOf(sock.user?.id), digitsOf(sock.user?.lid)].filter(Boolean);
+  if (!ids.some((d) => me.includes(d))) return;
+  const db = store();
+  if (db.aiGroups[u.id]?.ai) return;
+  if (Object.values(db.groupReqs).some((r) => r.gjid === u.id)) return;
+  const meta = await sock.groupMetadata(u.id).catch(() => null);
+  const name = meta?.subject || 'Grup';
+  const author = digitsOf(u.author);
+  if (author && OWNERS.has(author)) return approveGroup(sock, { type: 'added', gjid: u.id, name, by: 'owner' });
+  const id = newId();
+  db.groupReqs[id] = { type: 'added', gjid: u.id, name, size: meta?.participants?.length, by: author || '-', at: Date.now() };
+  saveMemory();
+  await sock.sendMessage(u.id, { text: '👋 Halo! Bot ini belum aktif di grup ini dan menunggu persetujuan owner. Jika tidak disetujui, bot akan keluar otomatis.' }).catch(() => {});
+  await askOwnerApproval(sock, id, '🚨 BOT DITAMBAHKAN KE GRUP',
+    `> Grup: *${name}*\n> Anggota: ${meta?.participants?.length ?? '-'}\n> Ditambahkan oleh: +${author || '?'}\n> ID: ${id}\n\nTidak disetujui dalam 15 menit → bot keluar otomatis.`);
+  pendingLeave.set(id, setTimeout(async () => {
+    pendingLeave.delete(id);
+    const d = store();
+    if (!d.groupReqs[id]) return;
+    delete d.groupReqs[id]; saveMemory();
+    await sock.sendMessage(u.id, { text: 'Tidak ada persetujuan owner. Bot keluar dari grup ini. 👋' }).catch(() => {});
+    await sock.groupLeave(u.id).catch(() => {});
+    await notifyOwner(sock, `ℹ️ Bot keluar otomatis dari grup *${name}* (tidak disetujui dalam 15 menit).`);
+  }, 15 * 60 * 1000));
+}
+
+// AI membalas semua pesan di grup yang sudah diaktifkan (throttle 4 dtk per grup)
+async function maybeGroupAI(c) {
+  const { sock, jid, msg, rawText, pushName, reply } = c;
+  if (!store().aiGroups[jid]?.ai || msg?.key?.fromMe || rawText.length < 2) return false;
+  const now = Date.now();
+  if (now - (groupAiAt.get(jid) || 0) < 4000) return false;
+  groupAiAt.set(jid, now);
+  if (groupAiAt.size > 500) for (const [k, t] of groupAiAt) if (now - t > 60000) groupAiAt.delete(k);
+  const who = pushName || 'Member';
+  const { st, prompt } = histPrompt(jid, who, rawText);
+  sock.sendPresenceUpdate('composing', jid).catch(() => {});
+  const out = await askAI(prompt, `${AI_PERSONA()} Kamu sedang berada di grup WhatsApp, balas ringkas (maks 3 kalimat) dan relevan dengan pesan terakhir.`);
+  sock.sendPresenceUpdate('paused', jid).catch(() => {});
+  if (!out) return false;
+  histPush(st, who, rawText, out);
+  await reply(out);
+  return true;
+}
+
 async function sendGroupMenu(c, id) {
   const g = MENU_GROUPS.find((x) => x.id === id);
   if (!g) return sendAllMenu(c);
@@ -652,6 +777,57 @@ on(['terjemah', 'translate'], async ({ param, reply }) => {
   return reply((await askAI(`Terjemahkan ke ${lang}: ${rest.join(' ')}`, 'Terjemahkan saja.')) || '-');
 }, { usage: 'en selamat pagi' });
 on('id', ({ jid, reply }) => reply(`🆔 \`${jid}\``));
+// Kelola AI grup: .grupsetuju/.gruptolak <id>, .aktifkanbot, .nonaktifkanbot, .grupdaftar
+on('grupsetuju', async (c) => {
+  if (!c.isOwner) return c.reply('🔒 Perintah ini khusus owner.');
+  const id = String(c.param || '').trim().split(/\s+/)[0];
+  const req = store().groupReqs[id];
+  if (!req) return c.reply('❌ ID permintaan tidak ditemukan atau sudah diproses.');
+  clearTimeout(pendingLeave.get(id)); pendingLeave.delete(id);
+  const ok = await approveGroup(c.sock, req, c.reply);
+  if (ok) { delete store().groupReqs[id]; await saveMemory(); }
+}, { usage: '.grupsetuju <id>' });
+on('gruptolak', async (c) => {
+  if (!c.isOwner) return c.reply('🔒 Perintah ini khusus owner.');
+  const id = String(c.param || '').trim().split(/\s+/)[0];
+  const db = store(); const req = db.groupReqs[id];
+  if (!req) return c.reply('❌ ID permintaan tidak ditemukan atau sudah diproses.');
+  clearTimeout(pendingLeave.get(id)); pendingLeave.delete(id);
+  delete db.groupReqs[id]; await saveMemory();
+  if (req.byJid) await c.sock.sendMessage(req.byJid, { text: `❌ Permintaan untuk grup *${req.name}* tidak disetujui owner.` }).catch(() => {});
+  if (req.type === 'added') {
+    await c.sock.sendMessage(req.gjid, { text: 'Owner tidak menyetujui bot di grup ini. Bot keluar. 👋' }).catch(() => {});
+    await c.sock.groupLeave(req.gjid).catch(() => {});
+  }
+  return c.reply(`🚫 Permintaan untuk *${req.name}* ditolak${req.type === 'added' ? ' dan bot keluar dari grup' : ''}.`);
+}, { usage: '.gruptolak <id>' });
+on('aktifkanbot', async (c) => {
+  if (!c.jid.endsWith('@g.us')) return c.reply('⚠️ Perintah ini dipakai di dalam grup.');
+  if (!c.isOwner) return c.reply('🔒 Hanya owner yang bisa mengaktifkan bot di grup. Kirim link grup ke chat pribadi bot untuk mengajukan.');
+  const meta = await c.sock.groupMetadata(c.jid).catch(() => null);
+  store().aiGroups[c.jid] = { name: meta?.subject || 'Grup', at: Date.now(), ai: true, by: 'owner' };
+  await saveMemory();
+  return c.reply('✅ *Bot aktif di grup ini.* AI akan membalas pesan di sini.');
+});
+on('nonaktifkanbot', async (c) => {
+  if (!c.jid.endsWith('@g.us')) return c.reply('⚠️ Perintah ini dipakai di dalam grup.');
+  if (!c.isOwner && !c.isSenderAdmin) return c.reply('⛔ Perintah ini khusus Owner atau Admin Grup.');
+  if (store().aiGroups[c.jid]) store().aiGroups[c.jid].ai = false;
+  await saveMemory();
+  return c.reply('⏸️ AI dinonaktifkan di grup ini. Owner bisa mengaktifkan lagi dengan *.aktifkanbot*.');
+});
+on('grupdaftar', async (c) => {
+  if (!c.isOwner) return c.reply('🔒 Perintah ini khusus owner.');
+  const db = store();
+  const on_ = Object.values(db.aiGroups).filter((g) => g.ai);
+  const pend = Object.entries(db.groupReqs);
+  return c.reply([
+    `*📋 GRUP AI* _(${on_.length} aktif)_`,
+    ...(on_.length ? on_.slice(0, 20).map((g) => `> ${g.name}`) : ['> (belum ada)']),
+    ...(pend.length ? ['', `*⏳ MENUNGGU* _(${pend.length})_`, ...pend.map(([id, r]) => `> ${r.name} • \`.grupsetuju ${id}\``)] : []),
+  ].join('\n'));
+});
+
 // Kelola Sari (khusus owner): .sari on|off|status|pesanan|tes <pesan>
 on('sari', async (c) => {
   const { isOwner, param, reply } = c;
@@ -827,6 +1003,12 @@ async function prosesSatuPesan(sock, msg) {
     const param = args.slice(1).join(' ').trim();
     const typing = () => { if (dbMemory.botSettings.autotyping) sock.sendPresenceUpdate('composing', jid).catch(() => {}); };
 
+    // Link grup di chat pribadi → ajukan aktivasi bot (owner: langsung disetujui)
+    if (!isGroup && !ALL_COMMANDS_SET.has(cmd)) {
+      const gl = rawText.match(GROUP_LINK_RE);
+      if (gl) { await handleGroupLinkRequest(c, gl[1]); return; }
+    }
+
     // Anti-spam per pengguna: tolak perintah yang datang terlalu cepat (owner bebas)
     if (!isOwner && (ALL_COMMANDS_SET.has(cmd) || (/^[.!/#]/.test(rawText) && NAZE_SET.has(cmd)))) {
       const w = cooldownWait(senderNum, cmd);
@@ -861,7 +1043,8 @@ async function prosesSatuPesan(sock, msg) {
     }
 
     if (isGroup) {
-      await handleGroupThemeInteraction({ sock, jid, senderParticipant: rawParticipant, pushName, rawText, unwrapped, msg, dbMemory, bot });
+      const handled = await handleGroupThemeInteraction({ sock, jid, senderParticipant: rawParticipant, pushName, rawText, unwrapped, msg, dbMemory, bot });
+      if (!handled) await maybeGroupAI(c);
       return;
     }
 
@@ -874,8 +1057,9 @@ async function prosesSatuPesan(sock, msg) {
       return;
     }
     if (!(await limit('chat_ai')).allowed) return;
-    const ai = await askAI(rawText, AI_PERSONA());
-    if (ai) await reply(ai);
+    const { st, prompt } = histPrompt(jid, pushName || 'Pengguna', rawText);
+    const ai = await askAI(prompt, AI_PERSONA());
+    if (ai) { histPush(st, pushName || 'Pengguna', rawText, ai); await reply(ai); }
   } catch (err) {
     const m = err?.message || 'Error';
     if (SIGNAL_ERR.test(m)) await triggerAutoCipherHeal(msg?.key?.remoteJid || '', m);
@@ -943,7 +1127,7 @@ async function start() {
     }
   });
   sock.ev.on('messages.upsert', ({ messages, type }) => { if (type === 'notify') for (const m of messages) prosesSatuPesan(sock, m).catch(() => {}); });
-  sock.ev.on('group-participants.update', (u) => handleGroupParticipantsUpdate(sock, dbMemory, u).catch(() => {}));
+  sock.ev.on('group-participants.update', (u) => { onBotAdded(sock, u).catch((e) => console.error('[grup] onBotAdded:', e?.message)); handleGroupParticipantsUpdate(sock, dbMemory, u).catch(() => {}); });
   sock.ev.on('group.join-request', (e) => handleGroupJoinRequestEvent(sock, dbMemory, e).catch(() => {}));
 
   startGroupAutomationScheduler(sock, dbMemory, saveMemory);
